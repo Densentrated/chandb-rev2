@@ -50,16 +50,29 @@ services:
         condition: service_healthy
     networks: [edge]
 
-  # Profiled so `docker compose up -d` doesn't start a batch job as a daemon.
-  # Run it with: docker compose --profile tools run --rm pipeline
+  # Long-lived ingest service. It owns its own schedule — nothing external
+  # triggers it. For a one-off run (testing, backfill):
+  #   docker compose run --rm pipeline -once
   pipeline:
     image: ${PORTAL_IMAGE}
-    profiles: ["tools"]
+    restart: unless-stopped
     entrypoint: ["/usr/local/bin/pipeline"]
     user: "10001:10001"
-    # Read-write, unlike the portal. That asymmetry is the point.
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    pids_limit: 128
+    mem_limit: 512m
+    environment:
+      INGEST_INTERVAL: 30m
+    tmpfs:
+      - /tmp:size=64m,uid=10001,mode=0700
     volumes:
+      # Read-write, unlike the portal. That asymmetry is the point.
       - /lake:/lake
+      # Ingest API keys (e.g. 511_api_key) as files, never env vars. Readable
+      # because the dir is deploy:portal 0750 and this runs as gid 10001.
+      - /opt/chandb/secrets:/run/secrets:ro
     networks: [edge]
 
 networks:

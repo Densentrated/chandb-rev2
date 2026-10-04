@@ -81,14 +81,18 @@
         dest: /etc/apt/keyrings/docker.asc
         mode: "0644"
 
+    # deb822 format, matching Docker's current published instructions.
+    # ansible.builtin.apt_repository is deprecated and goes away in
+    # ansible-core 2.25. Writes /etc/apt/sources.list.d/docker.sources.
     - name: Add Docker apt repository
-      ansible.builtin.apt_repository:
-        repo: >-
-          deb [arch={{ ansible_architecture | replace('x86_64', 'amd64') }}
-          signed-by=/etc/apt/keyrings/docker.asc]
-          https://download.docker.com/linux/ubuntu
-          {{ ansible_distribution_release }} stable
-        filename: docker
+      ansible.builtin.deb822_repository:
+        name: docker
+        types: [deb]
+        uris: https://download.docker.com/linux/ubuntu
+        suites: "{{ ansible_distribution_release }}"
+        components: [stable]
+        architectures: "{{ ansible_architecture | replace('x86_64', 'amd64') }}"
+        signed_by: /etc/apt/keyrings/docker.asc
         state: present
 
     - name: Install Docker Engine
@@ -175,6 +179,24 @@
     # 00- prefix, not 99-: OpenSSH is first-match-wins and Ubuntu includes
     # sshd_config.d/* at the TOP of sshd_config, so the cloud image's
     # 50-cloud-init.conf (PasswordAuthentication yes) would otherwise win.
+    # Refuse to disable password auth unless the Ansible user demonstrably has
+    # a key installed. On a box with one account and no root login, getting
+    # this wrong is a reinstall.
+    - name: Check the Ansible user's authorized_keys
+      ansible.builtin.stat:
+        path: "/home/{{ ansible_user }}/.ssh/authorized_keys"
+      register: admin_authorized_keys
+
+    - name: Refuse to harden sshd without a key for the Ansible user
+      ansible.builtin.assert:
+        that:
+          - admin_authorized_keys.stat.exists
+          - admin_authorized_keys.stat.size > 0
+        fail_msg: >-
+          {{ ansible_user }} has no authorized_keys on this host. Writing
+          PasswordAuthentication no now would lock you out with no way back in.
+          Run ssh-copy-id first (Phase 1 step 5).
+
     - name: Harden sshd
       ansible.builtin.copy:
         dest: /etc/ssh/sshd_config.d/00-hardening.conf
@@ -185,20 +207,24 @@
           KbdInteractiveAuthentication no
           PubkeyAuthentication yes
 
-    - name: Validate sshd config before touching the listener
+    - name: Validate sshd config
       ansible.builtin.command: /usr/sbin/sshd -t
       changed_when: false
 
-    # Ubuntu 24.04 socket-activates SSH, which makes reload semantics depend on
-    # which setting changed. Opt out: run a resident sshd instead. Done as one
-    # command so an aborted run can't leave nothing listening on 22.
-    - name: Replace socket activation with a resident sshd
-      ansible.builtin.shell: |
-        set -e
-        systemctl disable --now ssh.socket 2>/dev/null || true
-        systemctl enable --now ssh.service
-        systemctl restart ssh.service
-      changed_when: true
+    # NOTE: we deliberately leave Ubuntu's socket activation alone.
+    #
+    # An earlier version of this playbook disabled ssh.socket and ran a
+    # resident ssh.service for deterministic reload semantics. That is a trap
+    # on Ubuntu 24.04: the shipped drop-in /etc/systemd/system/ssh.service.d/
+    # 00-socket.conf adds `Requires=ssh.socket`, so disabling the socket leaves
+    # ssh.service with an unsatisfiable dependency. It fails to start, the
+    # socket is already stopped, and nothing is listening on 22 — a hard
+    # lockout on a box with one account.
+    #
+    # Keeping socket activation is also simply better here: sshd is spawned per
+    # connection and reads its config fresh every time, so 00-hardening.conf
+    # applies to the NEXT connection with no reload, restart, or handler at all.
+    # Nothing below needs to bounce a service.
 
     - name: Confirm something is listening on 22
       ansible.builtin.wait_for:
@@ -243,6 +269,28 @@
     # ------------------------------------------------------------------
     # fail2ban / unattended-upgrades
     # ------------------------------------------------------------------
+    # fail2ban auto-starts the moment apt installs it, with defaults we never
+    # chose. Make them explicit, and give yourself an escape hatch: fumbling
+    # ssh a few times during setup is enough to ban your own address, which
+    # looks exactly like being locked out.
+    #
+    # Add your own IP with:
+    #   ansible-playbook playbook.yml -e fail2ban_ignore_ips="$(curl -s ifconfig.me)"
+    - name: Configure the fail2ban sshd jail
+      ansible.builtin.copy:
+        dest: /etc/fail2ban/jail.local
+        mode: "0644"
+        content: |
+          [DEFAULT]
+          ignoreip = 127.0.0.1/8 ::1 {{ fail2ban_ignore_ips | default('') }}
+          bantime = 10m
+          findtime = 10m
+          maxretry = 5
+
+          [sshd]
+          enabled = true
+      notify: Restart fail2ban
+
     - name: Enable fail2ban
       ansible.builtin.service:
         name: fail2ban
@@ -254,3 +302,22 @@
         name: unattended-upgrades
         state: started
         enabled: true
+
+    # Final gate. Everything above runs over an ALREADY-OPEN ssh connection, so
+    # a broken sshd or firewall would not show up until the next login — which
+    # is how you discover a lockout the hard way. This dials port 22 from the
+    # control machine, through the public internet and the firewall we just
+    # enabled, exactly as your next login will.
+    - name: Confirm SSH is still reachable from outside
+      ansible.builtin.wait_for:
+        host: "{{ ansible_host }}"
+        port: 22
+        timeout: 30
+      delegate_to: localhost
+      become: false
+
+  handlers:
+    - name: Restart fail2ban
+      ansible.builtin.service:
+        name: fail2ban
+        state: restarted
