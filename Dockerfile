@@ -22,6 +22,10 @@ RUN go build -trimpath -ldflags="-s -w" -o /out/portal   ./cmd/portal \
 
 FROM debian:bookworm-slim
 
+# Links the GHCR package to the repo, so the image shows up on the repository
+# page and inherits its access settings.
+LABEL org.opencontainers.image.source="https://github.com/Densentrated/chandb-rev2"
+
 # ca-certificates for API ingest over TLS.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates \
