@@ -62,13 +62,22 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      # --include-deps exposes ansible-galaxy from ansible-lint's own venv.
-      # Without it, collections get installed by some other ansible-core (or
-      # none at all, since the runner has no system ansible) and ansible-lint
-      # fails with "couldn't resolve module/action 'ansible.posix.authorized_key'".
-      - run: pipx install ansible-lint --include-deps
-      - run: ansible-galaxy collection install -r infra/ansible/requirements.yml
-      - run: ansible-lint infra/ansible/playbook.yml
+      # Every binary below is called by explicit path, never through PATH.
+      #
+      # The runner ships its own ansible-core in /opt/pipx_bin, which wins PATH
+      # resolution over anything pipx installs for us. Collections then get
+      # installed by one ansible-core while ansible-lint runs under another, and
+      # the lint dies with:
+      #   couldn't resolve module/action 'ansible.posix.authorized_key'
+      #
+      # One venv, one interpreter, explicit paths: ansible-galaxy and
+      # ansible-lint are guaranteed to agree on where collections live.
+      - name: Lint the playbook
+        run: |
+          python3 -m venv .lintenv
+          ./.lintenv/bin/pip install --quiet --upgrade pip ansible-lint
+          ./.lintenv/bin/ansible-galaxy collection install -r infra/ansible/requirements.yml
+          ./.lintenv/bin/ansible-lint infra/ansible/playbook.yml
 
   # The single check to require in branch protection. Requiring this instead of
   # the individual jobs means adding or renaming a job never means editing the
