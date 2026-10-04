@@ -1,0 +1,87 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  # The Go scaffold doesn't exist yet. Rather than leave CI permanently red —
+  # which would block every merge once branch protection is on — detect whether
+  # there's anything to build. These jobs light up on their own the moment
+  # go.mod lands; nothing here needs changing later.
+  detect:
+    runs-on: ubuntu-latest
+    outputs:
+      has_go: ${{ steps.d.outputs.has_go }}
+    steps:
+      - uses: actions/checkout@v6
+      - id: d
+        run: |
+          if [ -f go.mod ]; then
+            echo "has_go=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_go=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::No go.mod yet - skipping the go and image jobs."
+          fi
+
+  go:
+    needs: detect
+    if: needs.detect.outputs.has_go == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+      - run: go vet ./...
+      - run: go build ./...
+      - run: go test -race ./...
+      - uses: golangci/golangci-lint-action@v9
+
+  image:
+    needs: detect
+    if: needs.detect.outputs.has_go == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: false
+          platforms: linux/amd64
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  infra:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      # --include-deps exposes ansible-galaxy from ansible-lint's own venv.
+      # Without it, collections get installed by some other ansible-core (or
+      # none at all, since the runner has no system ansible) and ansible-lint
+      # fails with "couldn't resolve module/action 'ansible.posix.authorized_key'".
+      - run: pipx install ansible-lint --include-deps
+      - run: ansible-galaxy collection install -r infra/ansible/requirements.yml
+      - run: ansible-lint infra/ansible/playbook.yml
+
+  # The single check to require in branch protection. Requiring this instead of
+  # the individual jobs means adding or renaming a job never means editing the
+  # ruleset.
+  #
+  # `if: always()` is load-bearing. Without it this job is SKIPPED when a
+  # dependency fails, and GitHub counts a skipped required check as satisfied —
+  # you would get a green merge button on a broken build.
+  ci-ok:
+    if: always()
+    needs: [detect, go, image, infra]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fail if any upstream job did not succeed
+        if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')
+        run: exit 1

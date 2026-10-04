@@ -1,0 +1,38 @@
+# Keep the build context small and keep anything secret-shaped out of it.
+#
+# The build is multi-stage, so these would not ship in the final image today —
+# only the runtime stage's layers get pushed. This file is belt-and-braces: it
+# speeds up `docker build`, and it means nothing sensitive is sitting in a layer
+# if the stages are ever collapsed. The published image is PUBLIC.
+
+.git
+.gitignore
+.github
+
+# Local Python leftovers from rev1
+.venv
+.ruff_cache
+__pycache__
+*.pyc
+
+# Infra and docs are not build inputs
+infra
+docs
+deploy
+Makefile
+docker-compose.dev.yml
+
+# Never build-context a secret or a data file
+.env
+*.env
+*.pem
+*.key
+id_*
+lake/
+*.parquet
+
+# Editor / OS noise
+.vscode
+.idea
+.DS_Store
+*.swp

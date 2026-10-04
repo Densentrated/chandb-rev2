@@ -1,0 +1,30 @@
+# Throwaway stack for the local dev machine.
+#   make dev-up / dev-ingest / dev-down
+#
+# Different ports and a different lake path so it can never touch host data, and
+# a separate compose project name so it won't collide if you ever run both on
+# one box. Treat everything here as disposable — `make dev-reset` wipes it.
+
+services:
+  postgres:
+    environment:
+      POSTGRES_PASSWORD: devpassword
+      PIPELINE_PASSWORD: devpassword
+      METABASE_RO_PASSWORD: devpassword
+      METABASE_APP_PASSWORD: devpassword
+    ports:
+      - "127.0.0.1:55432:5432"
+
+  metabase:
+    ports:
+      - "127.0.0.1:3001:3000"
+
+  pipeline:
+    environment:
+      PGPASSWORD: devpassword
+      LAKE_ROOT: /lake
+    volumes:
+      - ./lake-dev:/lake
+      - ./config:/app/config:ro
+      - ./sql:/app/sql:ro
+      - ./samples:/app/samples:ro

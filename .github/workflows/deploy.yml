@@ -1,0 +1,113 @@
+name: deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "Existing tag to roll back to (blank = build from HEAD)"
+        required: false
+
+# Queue overlapping deploys rather than killing one mid `compose up`.
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  # Lowercase is mandatory; GHCR rejects the repo's actual casing.
+  IMAGE: ghcr.io/densentrated/chandb-rev2
+
+jobs:
+  build:
+    if: inputs.image_tag == ''
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: true
+          platforms: linux/amd64
+          # The SHA tag is what makes rollback possible; latest is a convenience alias.
+          tags: |
+            ${{ env.IMAGE }}:${{ github.sha }}
+            ${{ env.IMAGE }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy:
+    needs: build
+    # build is skipped on a rollback dispatch, which is not a failure.
+    if: always() && (needs.build.result == 'success' || needs.build.result == 'skipped')
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v6
+
+      # Host key is pinned. Never StrictHostKeyChecking=no — that turns every
+      # deploy into an unauthenticated connection to whatever answers on that IP.
+      - name: Configure SSH
+        run: |
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "${{ secrets.SSH_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          printf '%s\n' "${{ secrets.SSH_KNOWN_HOSTS }}" > ~/.ssh/known_hosts
+          chmod 644 ~/.ssh/known_hosts
+
+      # --delete is what enforces "nothing on the VPS is hand-edited".
+      - name: Sync deploy manifests
+        run: |
+          rsync -az --delete \
+            -e "ssh -i ~/.ssh/id_ed25519" \
+            deploy/ \
+            ${{ vars.SSH_USER }}@${{ secrets.SSH_HOST }}:/opt/chandb/
+
+      # Written over stdin so the tunnel token never lands in the VPS process
+      # list or shell history. EOF must sit at the same indent as the other
+      # lines here: YAML strips the common indent, leaving it at column 0.
+      - name: Write environment file
+        run: |
+          TAG="${{ inputs.image_tag || github.sha }}"
+          ssh -i ~/.ssh/id_ed25519 ${{ vars.SSH_USER }}@${{ secrets.SSH_HOST }} \
+            'umask 077 && cat > /opt/chandb/.env' <<EOF
+          PORTAL_IMAGE=${{ env.IMAGE }}:${TAG}
+          CLOUDFLARE_TUNNEL_TOKEN=${{ secrets.CLOUDFLARE_TUNNEL_TOKEN }}
+          EOF
+
+      - name: Pull and restart
+        run: |
+          ssh -i ~/.ssh/id_ed25519 ${{ vars.SSH_USER }}@${{ secrets.SSH_HOST }} \
+            'cd /opt/chandb && docker compose pull && docker compose up -d --remove-orphans'
+
+      # No port is published and the image has no curl, so health has to be read
+      # from Docker rather than probed over the network.
+      - name: Wait for health
+        run: |
+          ssh -i ~/.ssh/id_ed25519 ${{ vars.SSH_USER }}@${{ secrets.SSH_HOST }} '
+            cd /opt/chandb
+            for i in $(seq 1 30); do
+              s=$(docker inspect --format "{{.State.Health.Status}}" \
+                    "$(docker compose ps -q portal)" 2>/dev/null || echo starting)
+              [ "$s" = healthy ] && exit 0
+              [ "$s" = unhealthy ] && { docker compose logs --tail=50 portal; exit 1; }
+              sleep 2
+            done
+            docker compose logs --tail=50 portal
+            exit 1'
+
+      - name: Prune old images
+        if: success()
+        run: |
+          ssh -i ~/.ssh/id_ed25519 ${{ vars.SSH_USER }}@${{ secrets.SSH_HOST }} \
+            'docker image prune -af --filter "until=168h"'

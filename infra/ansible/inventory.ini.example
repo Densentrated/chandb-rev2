@@ -1,0 +1,11 @@
+# Copy to inventory.ini and fill in your host. The real inventory.ini is
+# .gitignore'd so the VPS address and admin username stay out of the public repo.
+#
+#   cp inventory.ini.example inventory.ini
+#
+# This is tidiness, not a security control — see docs/gitops-plan.md, design
+# rule 5. The host is key-only SSH behind a default-deny firewall with no web
+# port published; it does not depend on its address being unknown.
+
+[vps]
+chandb ansible_host=203.0.113.10 ansible_user=youradminuser

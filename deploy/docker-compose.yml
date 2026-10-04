@@ -1,0 +1,66 @@
+# Rsynced to /opt/chandb/ by .github/workflows/deploy.yml. Do not hand-edit on
+# the VPS — the next deploy reverts it. See docs/gitops-plan.md Phase 4.
+#
+# There is deliberately no `ports:` key anywhere in this file. Nothing but
+# cloudflared can reach the origin, which is what makes CF-Connecting-IP
+# trustworthy for rate limiting.
+
+services:
+  portal:
+    image: ${PORTAL_IMAGE}
+    restart: unless-stopped
+    read_only: true
+    user: "10001:10001"
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    pids_limit: 256
+    # Deliberately above DuckDB's 2GB limit so the OOM killer isn't the first
+    # line of defense.
+    mem_limit: 3g
+    tmpfs:
+      - /var/tmp/duckdb-spill:size=1g,uid=10001,mode=0700
+    volumes:
+      - /lake:/lake:ro
+      - /opt/chandb/secrets:/run/secrets:ro
+    environment:
+      PORTAL_ADDR: ":8080"
+    # Requires a -healthcheck flag on the binary: the image has no curl, the
+    # container is read_only, and no port is published, so the host cannot
+    # probe it from outside.
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/portal", "-healthcheck"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 15s
+    networks: [edge]
+
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    restart: unless-stopped
+    command: tunnel --no-autoupdate run
+    # An env var is acceptable here. The architecture plan bans env-var secrets
+    # because DuckDB can read_blob('/proc/self/environ') — that threat is scoped
+    # to the portal container. cloudflared runs no untrusted queries and has a
+    # separate environment. Portal secrets still go in /opt/chandb/secrets.
+    environment:
+      TUNNEL_TOKEN: ${CLOUDFLARE_TUNNEL_TOKEN}
+    depends_on:
+      portal:
+        condition: service_healthy
+    networks: [edge]
+
+  # Profiled so `docker compose up -d` doesn't start a batch job as a daemon.
+  # Run it with: docker compose --profile tools run --rm pipeline
+  pipeline:
+    image: ${PORTAL_IMAGE}
+    profiles: ["tools"]
+    entrypoint: ["/usr/local/bin/pipeline"]
+    user: "10001:10001"
+    # Read-write, unlike the portal. That asymmetry is the point.
+    volumes:
+      - /lake:/lake
+    networks: [edge]
+
+networks:
+  edge:

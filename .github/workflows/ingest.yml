@@ -1,0 +1,41 @@
+name: ingest
+
+on:
+  workflow_dispatch:
+  # Enable this once cmd/pipeline exists. Left off for now because a scheduled
+  # workflow that fails every morning emails you every morning.
+  #
+  # Scheduled runs only ever use the default branch, and GitHub disables them
+  # after 60 days of repo inactivity. If ingest freshness starts mattering more
+  # than keeping everything in one place, move this to a systemd timer on the
+  # VPS (architecture plan, "Build & deploy").
+  #
+  # schedule:
+  #   - cron: "17 6 * * *"
+
+concurrency:
+  group: ingest-production
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  ingest:
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Configure SSH
+        run: |
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "${{ secrets.SSH_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          printf '%s\n' "${{ secrets.SSH_KNOWN_HOSTS }}" > ~/.ssh/known_hosts
+          chmod 644 ~/.ssh/known_hosts
+
+      # --profile tools is required: the pipeline service is profiled so that
+      # `compose up -d` doesn't start a batch job as a long-lived daemon.
+      - name: Run the pipeline
+        run: |
+          ssh -i ~/.ssh/id_ed25519 ${{ vars.SSH_USER }}@${{ secrets.SSH_HOST }} \
+            'cd /opt/chandb && docker compose --profile tools run --rm pipeline'
