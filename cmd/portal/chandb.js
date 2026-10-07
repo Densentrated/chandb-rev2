@@ -51,6 +51,17 @@ export async function boot() {
   return { db, conn, available, bytes, files };
 }
 
+// columnsOf returns the column names of a view as a Set.
+//
+// The pages ship inside the container image; the Parquet they read is rebuilt
+// independently by the pipeline. The two are therefore ALWAYS briefly out of
+// step on deploy, and a page that assumes a column exists breaks for everyone
+// until gold catches up. Ask first, then build SQL to match.
+export async function columnsOf(conn, table) {
+  const res = await conn.query(`DESCRIBE SELECT * FROM ${table}`);
+  return new Set(res.toArray().map(r => r.toJSON().column_name));
+}
+
 // ---------------------------------------------------------------------------
 // Time formatting
 //
@@ -96,6 +107,13 @@ export function fmtEta(sec) {
   if (n <= -60) return `${fmtDuration(-n)} ago`;
   if (n < 60) return 'due';
   return `in ${fmtDuration(n)}`;
+}
+
+// GTFS route_type as published, for lakes whose gold predates vehicle_type.
+export function typeFromRouteType(n) {
+  return ({ 0: 'Light Rail', 1: 'Subway', 2: 'Commuter Rail', 3: 'Bus',
+            4: 'Ferry', 5: 'Cable Tram', 6: 'Aerial Lift', 7: 'Funicular',
+            11: 'Trolleybus', 12: 'Monorail' })[Number(n)];
 }
 
 // GTFS route_type, decoded for display.

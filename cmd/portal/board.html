@@ -73,7 +73,7 @@
 </main>
 
 <script type="module">
-import { boot, fmtEta, fmtInstant, vehicleIcon } from '/chandb.js';
+import { boot, columnsOf, fmtEta, vehicleIcon, typeFromRouteType } from '/chandb.js';
 
 const $ = (id) => document.getElementById(id);
 const statusEl = $('status'), boardEl = $('board'), filterEl = $('filter');
@@ -88,11 +88,12 @@ let conn, rows = [], human = true;
 // "now" is the newest timestamp in the data, not the browser clock. Snapshots
 // are up to one ingest interval old, so counting down from wall-clock time
 // would show every departure as long gone.
-const SQL = (table) => `
+const SQL = (table, cols) => `
 WITH now AS (SELECT max(last_seen) AS t FROM ${table})
 SELECT stop_name,
        coalesce(route_short_name, route_long_name, route_id) AS route,
-       vehicle_type,
+       ${cols.has('vehicle_type') ? 'vehicle_type' : 'NULL AS vehicle_type'},
+       ${cols.has('route_type')   ? 'route_type'   : 'NULL AS route_type'},
        trip_headsign,
        arrival_time,
        arrival_time - (SELECT t FROM now) AS seconds_away
@@ -134,7 +135,9 @@ function render() {
       row.className = 'dep';
 
       const ico = document.createElement('span');
-      ico.textContent = vehicleIcon(d.vehicle_type);
+      // vehicle_type was added to gold later than this page; fall back to the
+      // raw GTFS route_type so older partitions still show the right icon.
+      ico.textContent = vehicleIcon(d.vehicle_type ?? typeFromRouteType(d.route_type));
 
       const mid = document.createElement('span');
       const rt = document.createElement('span');
@@ -168,7 +171,8 @@ async function load() {
     say('No stop_events table published yet. The pipeline writes it on its next cycle.', true);
     return;
   }
-  const res = await conn.query(SQL(table));
+  const cols = await columnsOf(conn, table);
+  const res = await conn.query(SQL(table, cols));
   rows = res.toArray().map(r => r.toJSON());
   render();
 }

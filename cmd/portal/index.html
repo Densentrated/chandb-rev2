@@ -95,7 +95,7 @@
 </main>
 
 <script type="module">
-import { boot, INSTANT_COLS, DURATION_COLS, fmtInstant, fmtDuration } from '/chandb.js';
+import { boot, columnsOf, INSTANT_COLS, DURATION_COLS, fmtInstant, fmtDuration } from '/chandb.js';
 
 const $ = (id) => document.getElementById(id);
 const statusEl = $('status'), sqlEl = $('sql'), runEl = $('run'),
@@ -106,8 +106,13 @@ const say = (msg, isErr = false) => {
   statusEl.classList.toggle('err', isErr);
 };
 
-// Each example declares the table it needs, so buttons for datasets the
-// pipeline has not published yet are hidden rather than offered and broken.
+// Each example declares the table — and optionally the columns — it needs.
+// Buttons are hidden unless the published data can actually satisfy them.
+//
+// This matters because the page and the Parquet deploy independently: the page
+// ships in the container image, gold is rebuilt by the pipeline on its own
+// cycle. A button referencing a column gold does not have yet is a guaranteed
+// Binder Error for whoever clicks it.
 const EXAMPLES = [
   { table: 'mbta_vehicle_positions', label: 'Where are the trains now?', sql:
 `SELECT route_short_name, trip_headsign, current_status,
@@ -190,7 +195,8 @@ WHERE lead_time_s IS NOT NULL
 GROUP BY 1
 ORDER BY 2 DESC;` },
 
-  { table: 'mbta_vehicle_positions', label: 'Vehicle types', sql:
+  { table: 'mbta_vehicle_positions', label: 'Vehicle types',
+    needs: ['vehicle_type', 'source'], sql:
 `-- vehicle_type is GTFS route_type decoded; source records which feed the
 -- row was ingested from, so unioned tables stay traceable.
 SELECT source, vehicle_type,
@@ -216,6 +222,7 @@ LIMIT 25;` },
 ];
 
 let available = new Set();
+let columns = new Map();   // table -> Set of column names
 
 // 'human' renders local clock times and durations; 'raw' shows the epoch
 // seconds the Parquet actually stores, which is what you need when writing
@@ -227,6 +234,8 @@ function renderExamples() {
   box.replaceChildren();
   for (const ex of EXAMPLES) {
     if (!available.has(ex.table)) continue;
+    const cols = columns.get(ex.table);
+    if (ex.needs && cols && !ex.needs.every(c => cols.has(c))) continue;
     const b = document.createElement('button');
     b.textContent = ex.label;
     b.onclick = () => { sqlEl.value = ex.sql; run(); };
@@ -240,7 +249,10 @@ async function init() {
   try {
     const ctx = await boot();
     conn = ctx.conn;
-    for (const name of ctx.available) available.add(name);
+    for (const name of ctx.available) {
+      available.add(name);
+      columns.set(name, await columnsOf(ctx.conn, name));
+    }
     if (!available.size) {
       say('No gold data published yet. The pipeline writes it on its next cycle.', true);
       return;
