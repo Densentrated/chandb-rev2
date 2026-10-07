@@ -160,13 +160,17 @@
           owner: deploy
           group: deploy
           mode: "0755"
-        # Written by CI (deploy), read by the portal container (gid 10001).
-        # 0750 with group portal is what makes both halves work; 0700 would
-        # lock the container out of its own secrets.
+        # Written by CI (deploy), read by the portal/pipeline containers
+        # (gid 10001). 0700 would lock the containers out of their own secrets.
+        #
+        # The setgid bit (the leading 2) is load-bearing: `deploy` is not a
+        # member of `portal`, so it cannot chgrp a file it creates. setgid makes
+        # new files inherit group `portal` from the directory automatically,
+        # which is what lets CI write a secret the containers can actually read.
         - path: /opt/chandb/secrets
           owner: deploy
           group: portal
-          mode: "0750"
+          mode: "2750"
         # Owned by the container UID: pipeline writes here, portal mounts :ro.
         - path: /lake
           owner: portal
