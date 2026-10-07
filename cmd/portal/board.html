@@ -1,0 +1,196 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>chandb — departure board</title>
+<style>
+  :root {
+    --bg: #0f1115; --panel: #171a21; --line: #272b35;
+    --fg: #e6e8ee; --muted: #8b93a7; --accent: #6ea8fe;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg);
+         font: 15px/1.5 system-ui, -apple-system, sans-serif; }
+  header { padding: 20px 24px 12px; border-bottom: 1px solid var(--line); }
+  h1 { margin: 0 0 4px; font-size: 18px; font-weight: 600; }
+  .sub { color: var(--muted); font-size: 13px; }
+  .sub a { color: var(--accent); }
+  main { padding: 18px 24px 48px; max-width: 1400px; }
+  .controls { display: flex; gap: 10px; align-items: center;
+              margin-bottom: 16px; flex-wrap: wrap; }
+  input[type=search] {
+    flex: 1 1 260px; max-width: 420px; padding: 8px 12px;
+    background: var(--panel); color: var(--fg);
+    border: 1px solid var(--line); border-radius: 6px; font-size: 13px;
+  }
+  input[type=search]:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+  button {
+    padding: 8px 14px; border-radius: 6px; cursor: pointer; font-size: 13px;
+    background: var(--panel); color: var(--muted); border: 1px solid var(--line);
+  }
+  button:hover { color: var(--fg); border-color: var(--accent); }
+  #status { margin-bottom: 14px; padding: 8px 12px; border-radius: 6px;
+            background: var(--panel); border: 1px solid var(--line);
+            font: 12px/1.4 var(--mono); color: var(--muted); }
+  #status.err { color: #ff8e8e; border-color: #5a2b2b; }
+  .board { display: grid; gap: 12px;
+           grid-template-columns: repeat(auto-fill, minmax(340px, 1fr)); }
+  .station { background: var(--panel); border: 1px solid var(--line);
+             border-radius: 8px; padding: 12px 14px; }
+  .station h2 { margin: 0 0 8px; font-size: 14px; font-weight: 600; }
+  .dep { display: grid; grid-template-columns: 24px minmax(0,1fr) auto;
+         gap: 10px; align-items: baseline; padding: 5px 0;
+         border-top: 1px solid var(--line); font-size: 13px; }
+  .dep:first-of-type { border-top: 0; }
+  .rt { font-weight: 600; }
+  .to { color: var(--muted); font-size: 12px;
+        overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .eta { font: 600 13px/1 var(--mono); color: var(--accent); white-space: nowrap; }
+  .eta.past { color: var(--muted); font-weight: 400; }
+</style>
+</head>
+<body>
+<header>
+  <h1>chandb — departure board</h1>
+  <div class="sub">
+    Next arrivals per station, from the gold layer.
+    <a href="/">SQL viewer →</a>
+  </div>
+</header>
+
+<main>
+  <div id="status">booting DuckDB-WASM…</div>
+
+  <div class="controls">
+    <input type="search" id="filter" placeholder="Filter stations… e.g. Government, Symphony">
+    <button id="tmode" type="button">Times: human-readable</button>
+    <button id="reload" type="button">Refresh</button>
+  </div>
+
+  <div class="board" id="board"></div>
+</main>
+
+<script type="module">
+import { boot, fmtEta, fmtInstant, vehicleIcon } from '/chandb.js';
+
+const $ = (id) => document.getElementById(id);
+const statusEl = $('status'), boardEl = $('board'), filterEl = $('filter');
+
+const say = (msg, isErr = false) => {
+  statusEl.textContent = msg;
+  statusEl.classList.toggle('err', isErr);
+};
+
+let conn, rows = [], human = true;
+
+// "now" is the newest timestamp in the data, not the browser clock. Snapshots
+// are up to one ingest interval old, so counting down from wall-clock time
+// would show every departure as long gone.
+const SQL = (table) => `
+WITH now AS (SELECT max(last_seen) AS t FROM ${table})
+SELECT stop_name,
+       coalesce(route_short_name, route_long_name, route_id) AS route,
+       vehicle_type,
+       trip_headsign,
+       arrival_time,
+       arrival_time - (SELECT t FROM now) AS seconds_away
+FROM ${table}
+WHERE stop_name   IS NOT NULL
+  AND arrival_time IS NOT NULL
+  AND arrival_time BETWEEN (SELECT t FROM now) - 600
+                       AND (SELECT t FROM now) + 3600
+ORDER BY stop_name, arrival_time`;
+
+function render() {
+  const q = filterEl.value.trim().toLowerCase();
+  const byStop = new Map();
+
+  for (const r of rows) {
+    if (q && !r.stop_name.toLowerCase().includes(q)) continue;
+    if (!byStop.has(r.stop_name)) byStop.set(r.stop_name, []);
+    const list = byStop.get(r.stop_name);
+    if (list.length < 6) list.push(r); // a board shows the next few, not all
+  }
+
+  boardEl.replaceChildren();
+  if (!byStop.size) {
+    say(q ? `No stations matching "${filterEl.value}".`
+          : 'No upcoming arrivals in the latest snapshot.');
+    return;
+  }
+
+  for (const [stop, deps] of byStop) {
+    const card = document.createElement('section');
+    card.className = 'station';
+
+    const h = document.createElement('h2');
+    h.textContent = stop;                 // textContent: upstream names, never innerHTML
+    card.appendChild(h);
+
+    for (const d of deps) {
+      const row = document.createElement('div');
+      row.className = 'dep';
+
+      const ico = document.createElement('span');
+      ico.textContent = vehicleIcon(d.vehicle_type);
+
+      const mid = document.createElement('span');
+      const rt = document.createElement('span');
+      rt.className = 'rt';
+      rt.textContent = d.route ?? '?';
+      const to = document.createElement('div');
+      to.className = 'to';
+      to.textContent = d.trip_headsign ?? '';
+      mid.append(rt, to);
+
+      const eta = document.createElement('span');
+      eta.className = 'eta' + (d.seconds_away < -60 ? ' past' : '');
+      eta.textContent = human
+        ? fmtEta(d.seconds_away)
+        : String(d.arrival_time);         // raw epoch seconds, as stored
+
+      row.append(ico, mid, eta);
+      card.appendChild(row);
+    }
+    boardEl.appendChild(card);
+  }
+
+  const shown = [...byStop.values()].reduce((n, l) => n + l.length, 0);
+  say(`${byStop.size} station(s), ${shown} departure(s) — queried in your browser`);
+}
+
+async function load() {
+  const table = ['mbta_stop_events', 'bart_stop_events']
+    .find(t => available.has(t));
+  if (!table) {
+    say('No stop_events table published yet. The pipeline writes it on its next cycle.', true);
+    return;
+  }
+  const res = await conn.query(SQL(table));
+  rows = res.toArray().map(r => r.toJSON());
+  render();
+}
+
+let available;
+try {
+  const ctx = await boot();
+  conn = ctx.conn;
+  available = ctx.available;
+  await load();
+} catch (e) {
+  say('failed to start: ' + e, true);
+  console.error(e);
+}
+
+filterEl.addEventListener('input', render);
+$('reload').onclick = () => load().catch(e => say(String(e), true));
+$('tmode').onclick = (e) => {
+  human = !human;
+  e.target.textContent = human ? 'Times: human-readable' : 'Times: epoch seconds';
+  render();
+};
+</script>
+</body>
+</html>

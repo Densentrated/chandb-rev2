@@ -49,8 +49,46 @@ func TestIndexServesHTML(t *testing.T) {
 	if ct := rec.Header().Get("Content-Type"); !strings.HasPrefix(ct, "text/html") {
 		t.Errorf("content-type = %q, want text/html", ct)
 	}
-	if !strings.Contains(rec.Body.String(), "duckdb-wasm") {
-		t.Error("page should load duckdb-wasm")
+	// The engine setup lives in the shared module now, not inline.
+	if !strings.Contains(rec.Body.String(), "/chandb.js") {
+		t.Error("page should import the shared runtime")
+	}
+}
+
+func TestBoardPageIsServed(t *testing.T) {
+	rec := httptest.NewRecorder()
+	servePage(boardHTML, "text/html; charset=utf-8")(
+		rec, httptest.NewRequest(http.MethodGet, "/board", nil))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "/chandb.js") {
+		t.Error("board should import the shared runtime")
+	}
+	if !strings.Contains(body, "stop_events") {
+		t.Error("board should query a stop_events table")
+	}
+}
+
+// A module delivered with the wrong Content-Type is refused by every browser,
+// and both pages are ES modules importing this one.
+func TestSharedRuntimeServedAsJavaScript(t *testing.T) {
+	rec := httptest.NewRecorder()
+	servePage(chandbJS, "text/javascript; charset=utf-8")(
+		rec, httptest.NewRequest(http.MethodGet, "/chandb.js", nil))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	if ct := rec.Header().Get("Content-Type"); !strings.HasPrefix(ct, "text/javascript") {
+		t.Errorf("content-type = %q, want text/javascript", ct)
+	}
+	for _, want := range []string{"duckdb-wasm", "export async function boot", "fmtEta"} {
+		if !strings.Contains(rec.Body.String(), want) {
+			t.Errorf("shared runtime missing %q", want)
+		}
 	}
 }
 

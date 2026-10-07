@@ -54,6 +54,9 @@
        font-weight: 600; z-index: 1; }
   td.null { color: #5a6072; font-style: italic; }
   td.num { text-align: right; }
+  .toggle { background: var(--panel); color: var(--muted); border: 1px solid var(--line);
+            font-weight: 400; font-size: 12px; padding: 6px 12px; }
+  .toggle:hover { color: var(--fg); border-color: var(--accent); }
   footer { margin-top: 24px; color: var(--muted); font-size: 12px; }
   a { color: var(--accent); }
 </style>
@@ -65,6 +68,7 @@
     Snapshots every 30 minutes, joined against each agency's static GTFS.
     <strong>Queries run in your browser</strong> — DuckDB-WASM reads Parquet
     straight off this server over HTTP range requests. Nothing is sent back.
+    <a href="/board">Departure board →</a>
   </div>
 </header>
 
@@ -76,6 +80,7 @@
   <textarea id="sql" spellcheck="false"></textarea>
   <div class="row">
     <button id="run" disabled>Run query</button>
+    <button id="tmode" class="toggle" type="button">Times: human-readable</button>
     <span class="hint">Ctrl/⌘ + Enter</span>
     <span class="hint" id="timing"></span>
   </div>
@@ -90,7 +95,7 @@
 </main>
 
 <script type="module">
-import * as duckdb from 'https://cdn.jsdelivr.net/npm/@duckdb/duckdb-wasm@1.32.0/+esm';
+import { boot, INSTANT_COLS, DURATION_COLS, fmtInstant, fmtDuration } from '/chandb.js';
 
 const $ = (id) => document.getElementById(id);
 const statusEl = $('status'), sqlEl = $('sql'), runEl = $('run'),
@@ -212,6 +217,11 @@ LIMIT 25;` },
 
 let available = new Set();
 
+// 'human' renders local clock times and durations; 'raw' shows the epoch
+// seconds the Parquet actually stores, which is what you need when writing
+// a query against them.
+let timeMode = 'human';
+
 function renderExamples() {
   const box = $('examples');
   box.replaceChildren();
@@ -224,59 +234,21 @@ function renderExamples() {
   }
 }
 
-// Build the worker from a blob so the CDN script isn't loaded cross-origin
-// as a worker, which browsers refuse.
-async function boot() {
-  const bundles = duckdb.getJsDelivrBundles();
-  const bundle = await duckdb.selectBundle(bundles);
-  const workerURL = URL.createObjectURL(new Blob(
-    [`importScripts("${bundle.mainWorker}");`], { type: 'text/javascript' }));
-
-  const db = new duckdb.AsyncDuckDB(new duckdb.ConsoleLogger(), new Worker(workerURL));
-  await db.instantiate(bundle.mainModule, bundle.pthreadWorker);
-  URL.revokeObjectURL(workerURL);
-  return db;
-}
-
 let conn;
 
 async function init() {
   try {
-    const db = await boot();
-    conn = await db.connect();
-
-    say('loading dataset index…');
-    const sets = await (await fetch('/api/datasets')).json();
-    if (!sets.length) {
+    const ctx = await boot();
+    conn = ctx.conn;
+    for (const name of ctx.available) available.add(name);
+    if (!available.size) {
       say('No gold data published yet. The pipeline writes it on its next cycle.', true);
       return;
     }
-
-    // Register each partition by URL and expose one view per dataset.
-    // DuckDB-WASM issues HTTP range requests, so a selective query fetches
-    // only the row groups it needs rather than whole files.
-    let totalBytes = 0, totalFiles = 0;
-    for (const ds of sets) {
-      const names = [];
-      for (const url of ds.files) {
-        const name = url.replace(/^\/data\//, '').replace(/\//g, '_');
-        await db.registerFileURL(name, new URL(url, location.href).href,
-                                 duckdb.DuckDBDataProtocol.HTTP, false);
-        names.push(name);
-      }
-      const list = names.map(n => `'${n}'`).join(', ');
-      // Dataset names come from directory names on our own disk, not user
-      // input, and the server only ever exposes the gold tree.
-      await conn.query(`CREATE OR REPLACE VIEW ${ds.name} AS
-                        SELECT * FROM read_parquet([${list}])`);
-      available.add(ds.name);
-      totalBytes += ds.bytes;
-      totalFiles += ds.files.length;
-    }
     renderExamples();
 
-    const mb = (totalBytes / 1048576).toFixed(1);
-    say(`ready — ${[...available].join(', ')} · ${totalFiles} partition(s), ${mb} MB, queried in your browser`);
+    const mb = (ctx.bytes / 1048576).toFixed(1);
+    say(`ready — ${[...available].join(', ')} · ${ctx.files} partition(s), ${mb} MB, queried in your browser`);
     runEl.disabled = false;
     sqlEl.value = (EXAMPLES.find(e => available.has(e.table)) || EXAMPLES[0]).sql;
     await run();
@@ -286,11 +258,16 @@ async function init() {
   }
 }
 
-function cell(v) {
+function cell(v, col) {
   const td = document.createElement('td');
   if (v === null || v === undefined) { td.textContent = 'NULL'; td.className = 'null'; return td; }
-  if (typeof v === 'bigint') { td.textContent = v.toString(); td.className = 'num'; return td; }
-  if (typeof v === 'number') { td.textContent = String(v); td.className = 'num'; return td; }
+  if (typeof v === 'bigint' || typeof v === 'number') {
+    td.className = 'num';
+    if (timeMode === 'human' && INSTANT_COLS.has(col)) td.textContent = fmtInstant(v);
+    else if (timeMode === 'human' && DURATION_COLS.has(col)) td.textContent = fmtDuration(v);
+    else td.textContent = v.toString();
+    return td;
+  }
   // textContent, never innerHTML: route and stop names are upstream data and
   // must never be able to inject markup into this page.
   td.textContent = String(v);
@@ -318,7 +295,7 @@ async function run() {
     for (const r of rows) {
       const tr = tbody.insertRow();
       const o = r.toJSON();
-      for (const c of cols) tr.appendChild(cell(o[c]));
+      for (const c of cols) tr.appendChild(cell(o[c], c));
     }
     timingEl.textContent =
       `${rows.length} row(s) in ${(performance.now() - t0).toFixed(0)} ms`;
@@ -329,6 +306,13 @@ async function run() {
     runEl.disabled = false;
   }
 }
+
+$('tmode').onclick = (e) => {
+  timeMode = timeMode === 'human' ? 'raw' : 'human';
+  e.target.textContent = timeMode === 'human'
+    ? 'Times: human-readable' : 'Times: epoch seconds';
+  run();
+};
 
 runEl.onclick = run;
 sqlEl.addEventListener('keydown', (e) => {

@@ -48,6 +48,15 @@ const (
 //go:embed index.html
 var indexHTML []byte
 
+//go:embed board.html
+var boardHTML []byte
+
+// Shared browser runtime. Both pages import it, so the DuckDB-WASM setup and
+// dataset registration exist once rather than per page.
+//
+//go:embed chandb.js
+var chandbJS []byte
+
 func main() {
 	healthcheck := flag.Bool("healthcheck", false,
 		"probe the local instance over HTTP and exit 0 if healthy")
@@ -114,6 +123,10 @@ func run() error {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", handleHealthz)
+	mux.HandleFunc("GET /board", servePage(boardHTML, "text/html; charset=utf-8"))
+	// Must be served as JavaScript: browsers refuse to evaluate a module
+	// delivered with the wrong Content-Type.
+	mux.HandleFunc("GET /chandb.js", servePage(chandbJS, "text/javascript; charset=utf-8"))
 	mux.HandleFunc("GET /api/datasets", handleDatasets(goldDir))
 	mux.Handle("GET /data/", http.StripPrefix("/data/", dataServer(goldDir)))
 	mux.HandleFunc("GET /", handleIndex)
@@ -161,6 +174,14 @@ func handleHealthz(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	_, _ = fmt.Fprintln(w, "ok")
+}
+
+func servePage(body []byte, contentType string) http.HandlerFunc {
+	return func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", contentType)
+		w.Header().Set("Cache-Control", "public, max-age=60")
+		_, _ = w.Write(body)
+	}
 }
 
 func handleIndex(w http.ResponseWriter, r *http.Request) {
