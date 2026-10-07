@@ -117,6 +117,13 @@ var feeds = []feed{
 		ext:    "zip",
 		daily:  true,
 	},
+	{
+		agency: "bart",
+		name:   "gtfs_static",
+		url:    "https://www.bart.gov/dev/schedules/google_transit.zip",
+		ext:    "zip",
+		daily:  true,
+	},
 }
 
 const defaultInterval = 30 * time.Minute

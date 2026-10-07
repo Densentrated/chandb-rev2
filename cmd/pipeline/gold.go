@@ -51,7 +51,7 @@ var staticLoads = []struct{ file, stmt string }{
   SELECT route_id, route_short_name, route_long_name, route_type, route_color
   FROM read_csv(?, types={'route_id':'VARCHAR'}, quote='"', escape='"')`},
 	{"trips.txt", `CREATE OR REPLACE TEMP TABLE gtfs_trips AS
-  SELECT trip_id, trip_headsign
+  SELECT trip_id, route_id AS trip_route_id, trip_headsign
   FROM read_csv(?, types={'trip_id':'VARCHAR','route_id':'VARCHAR'}, quote='"', escape='"')`},
 	{"stops.txt", `CREATE OR REPLACE TEMP TABLE gtfs_stops AS
   SELECT stop_id, stop_name, stop_lat, stop_lon
@@ -76,10 +76,17 @@ COPY (
     v.vehicle_id,
     v.label,
     v.trip_id,
-    v.route_id,
+    coalesce(v.route_id, t.trip_route_id) AS route_id,
     r.route_short_name,
     r.route_long_name,
     r.route_type,
+    CASE r.route_type
+      WHEN 0 THEN 'Light Rail' WHEN 1 THEN 'Subway'   WHEN 2 THEN 'Commuter Rail'
+      WHEN 3 THEN 'Bus'        WHEN 4 THEN 'Ferry'    WHEN 5 THEN 'Cable Tram'
+      WHEN 6 THEN 'Aerial Lift' WHEN 7 THEN 'Funicular'
+      WHEN 11 THEN 'Trolleybus' WHEN 12 THEN 'Monorail'
+    END                                   AS vehicle_type,
+    '{{SOURCE}}'                          AS source,
     r.route_color,
     t.trip_headsign,
     v.direction_id,
@@ -98,8 +105,8 @@ COPY (
         'direction_id':'BIGINT','latitude':'DOUBLE','longitude':'DOUBLE',
         'bearing':'DOUBLE','speed_mps':'DOUBLE','stop_id':'VARCHAR',
         'current_status':'VARCHAR','vehicle_timestamp':'BIGINT'}) v
-  LEFT JOIN gtfs_routes r ON r.route_id = v.route_id
   LEFT JOIN gtfs_trips  t ON t.trip_id  = v.trip_id
+  LEFT JOIN gtfs_routes r ON r.route_id = coalesce(v.route_id, t.trip_route_id)
   LEFT JOIN gtfs_stops  s ON s.stop_id  = v.stop_id
   WHERE v.latitude IS NOT NULL
   ORDER BY v.feed_timestamp, v.vehicle_id
@@ -145,10 +152,17 @@ COPY (
   SELECT
     u.agency,
     u.trip_id,
-    u.route_id,
+    coalesce(u.route_id, t.trip_route_id) AS route_id,
     r.route_short_name,
     r.route_long_name,
     r.route_type,
+    CASE r.route_type
+      WHEN 0 THEN 'Light Rail' WHEN 1 THEN 'Subway'   WHEN 2 THEN 'Commuter Rail'
+      WHEN 3 THEN 'Bus'        WHEN 4 THEN 'Ferry'    WHEN 5 THEN 'Cable Tram'
+      WHEN 6 THEN 'Aerial Lift' WHEN 7 THEN 'Funicular'
+      WHEN 11 THEN 'Trolleybus' WHEN 12 THEN 'Monorail'
+    END                                   AS vehicle_type,
+    '{{SOURCE}}'                          AS source,
     t.trip_headsign,
     u.direction_id,
     u.vehicle_id,
@@ -167,8 +181,11 @@ COPY (
     u.observations,
     u.arrival_time - u.feed_timestamp  AS lead_time_s
   FROM ranked u
-  LEFT JOIN gtfs_routes r ON r.route_id = u.route_id
   LEFT JOIN gtfs_trips  t ON t.trip_id  = u.trip_id
+  -- BART's TripUpdates carry no route_id at all, so fall back to the route
+  -- the static schedule assigns the trip. Without this every BART route name
+  -- is NULL.
+  LEFT JOIN gtfs_routes r ON r.route_id = coalesce(u.route_id, t.trip_route_id)
   LEFT JOIN gtfs_stops  s ON s.stop_id  = u.stop_id
   WHERE u.rn = 1
   ORDER BY u.route_id, u.trip_id, u.stop_sequence
@@ -191,12 +208,6 @@ var goldTables = []goldTable{
 }
 
 func transformGold(ctx context.Context, lake string) {
-	staticDir, err := latestStaticDir(lake)
-	if err != nil {
-		slog.Debug("gold skipped, no static GTFS yet", "err", err)
-		return
-	}
-
 	db, err := openDuckDB()
 	if err != nil {
 		slog.Warn("gold skipped, duckdb unavailable", "err", err)
@@ -204,70 +215,100 @@ func transformGold(ctx context.Context, lake string) {
 	}
 	defer func() { _ = db.Close() }()
 
-	if err := loadStatic(ctx, db, staticDir); err != nil {
-		slog.Warn("gold skipped, static tables would not load", "err", err)
-		return
-	}
-
 	today := "dt=" + time.Now().UTC().Format("2006-01-02")
 	var built int
 	start := time.Now()
 
-	for _, tbl := range goldTables {
-		srcRoot := filepath.Join(lake, "bronze", tbl.agency, tbl.source)
-		parts, err := os.ReadDir(srcRoot)
+	// Static lookups are per-agency and MUST stay that way. Joining one
+	// agency's realtime feed against another's routes/stops silently yields
+	// NULL names at best, and at worst invents matches where ids collide.
+	for _, agency := range goldAgencies() {
+		staticDir, err := latestStaticDir(lake, agency)
 		if err != nil {
-			continue // that bronze table has not been produced yet
+			slog.Debug("gold skipped, no static GTFS yet", "agency", agency)
+			continue
+		}
+		if err := loadStatic(ctx, db, staticDir); err != nil {
+			slog.Warn("gold skipped, static tables would not load",
+				"agency", agency, "err", err)
+			continue
 		}
 
-		for _, p := range parts {
-			if ctx.Err() != nil {
-				return
-			}
-			name := p.Name()
-			if !p.IsDir() || !dtPartition.MatchString(name) {
+		for _, tbl := range goldTables {
+			if tbl.agency != agency {
 				continue
+			}
+			srcRoot := filepath.Join(lake, "bronze", tbl.agency, tbl.source)
+			parts, err := os.ReadDir(srcRoot)
+			if err != nil {
+				continue // that bronze table has not been produced yet
 			}
 
-			outDir := filepath.Join(lake, "gold", tbl.agency, tbl.out, name)
-			outFile := filepath.Join(outDir, "part-0.parquet")
+			for _, p := range parts {
+				if ctx.Err() != nil {
+					return
+				}
+				name := p.Name()
+				if !p.IsDir() || !dtPartition.MatchString(name) {
+					continue
+				}
 
-			// Past days are complete, so an existing file is final. Today's is
-			// still accumulating snapshots, so rebuild it every cycle.
-			if _, err := os.Stat(outFile); err == nil && name != today {
-				continue
-			}
-			if err := os.MkdirAll(outDir, 0o755); err != nil {
-				slog.Warn("gold mkdir failed", "dir", outDir, "err", err)
-				continue
-			}
+				outDir := filepath.Join(lake, "gold", tbl.agency, tbl.out, name)
+				outFile := filepath.Join(outDir, "part-0.parquet")
 
-			if err := buildGoldPartition(ctx, db, tbl.query,
-				filepath.Join(srcRoot, name, "*.ndjson"), outFile); err != nil {
-				slog.Warn("gold partition failed",
-					"table", tbl.agency+"/"+tbl.out, "partition", name, "err", err)
-				continue
+				// Past days are complete, so an existing file is final.
+				// Today's is still accumulating, so rebuild it every cycle.
+				if _, err := os.Stat(outFile); err == nil && name != today {
+					continue
+				}
+				if err := os.MkdirAll(outDir, 0o755); err != nil {
+					slog.Warn("gold mkdir failed", "dir", outDir, "err", err)
+					continue
+				}
+
+				if err := buildGoldPartition(ctx, db, tbl.query,
+					tbl.agency+"/"+tbl.source,
+					filepath.Join(srcRoot, name, "*.ndjson"), outFile); err != nil {
+					slog.Warn("gold partition failed",
+						"table", tbl.agency+"/"+tbl.out,
+						"partition", name, "err", err)
+					continue
+				}
+				built++
 			}
-			built++
 		}
 	}
 
 	if built > 0 {
-		slog.Info("gold",
-			"partitions", built,
-			"static", filepath.Base(staticDir),
+		slog.Info("gold", "partitions", built,
 			"elapsed", time.Since(start).Round(time.Millisecond))
 	}
 }
 
+// goldAgencies lists the agencies with gold tables, in a stable order so logs
+// read the same way run to run.
+func goldAgencies() []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, t := range goldTables {
+		if !seen[t.agency] {
+			seen[t.agency] = true
+			out = append(out, t.agency)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
 func buildGoldPartition(ctx context.Context, db *sql.DB,
-	query, srcGlob, outFile string) error {
+	query, source, srcGlob, outFile string) error {
 	// COPY ... TO cannot be parameterised, so it is built by hand. Safe here
 	// because the partition name is regex-validated above and every other
 	// component is a constant: this code never sees user input. The portal,
 	// which does, must never allow COPY at all.
 	tmp := outFile + ".partial"
 	q := strings.Replace(query, ") TO ?", ") TO '"+tmp+"'", 1)
+	q = strings.ReplaceAll(q, "{{SOURCE}}", source)
 
 	if _, err := db.ExecContext(ctx, q, srcGlob); err != nil {
 		_ = os.Remove(tmp)
@@ -314,8 +355,8 @@ func openDuckDB() (*sql.DB, error) {
 // latestStaticDir returns the newest bronze GTFS snapshot that actually has
 // every table extracted. Partial snapshots are skipped so a gold build never
 // half-joins against an interrupted download.
-func latestStaticDir(lake string) (string, error) {
-	root := filepath.Join(lake, "bronze", "mbta", "gtfs_static")
+func latestStaticDir(lake, agency string) (string, error) {
+	root := filepath.Join(lake, "bronze", agency, "gtfs_static")
 	entries, err := os.ReadDir(root)
 	if err != nil {
 		return "", err

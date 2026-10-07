@@ -133,7 +133,7 @@ func TestLatestStaticDirSkipsIncomplete(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	got, err := latestStaticDir(lake)
+	got, err := latestStaticDir(lake, "mbta")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -143,7 +143,7 @@ func TestLatestStaticDirSkipsIncomplete(t *testing.T) {
 }
 
 func TestLatestStaticDirErrorsWhenNoneUsable(t *testing.T) {
-	if _, err := latestStaticDir(t.TempDir()); err == nil {
+	if _, err := latestStaticDir(t.TempDir(), "mbta"); err == nil {
 		t.Error("expected an error when no static snapshot exists")
 	}
 }
