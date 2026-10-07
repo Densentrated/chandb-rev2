@@ -46,7 +46,7 @@ const (
 	userAgent    = "chandb-rev2/0.1 (+https://github.com/Densentrated/chandb-rev2)"
 )
 
-// feed is one GTFS-Realtime endpoint to snapshot.
+// feed is one endpoint to snapshot.
 type feed struct {
 	agency string
 	name   string
@@ -56,6 +56,19 @@ type feed struct {
 	// feed is skipped rather than failed, so this runs fine before you have
 	// a key.
 	secret string
+	// ext is the snapshot file extension, without the dot. Defaults to "pb".
+	ext string
+	// daily caps the feed at one snapshot per dt= partition. Static GTFS is
+	// a 24MB zip that changes about weekly; pulling it every 30 minutes would
+	// be 1.1GB/day of identical bytes.
+	daily bool
+}
+
+func (f feed) extension() string {
+	if f.ext == "" {
+		return "pb"
+	}
+	return f.ext
 }
 
 var feeds = []feed{
@@ -92,6 +105,17 @@ var feeds = []feed{
 		name:   "vehicle_positions",
 		url:    "https://api.511.org/transit/vehiclepositions?agency=BA&api_key={key}",
 		secret: "511_api_key",
+	},
+
+	// Static GTFS: the lookup tables that turn realtime IDs into meaning.
+	// Without this, a vehicle is "route_id 714 near stop_id 71420"; with it,
+	// that's the Pemberton Point bus near a named stop with coordinates.
+	{
+		agency: "mbta",
+		name:   "gtfs_static",
+		url:    "https://cdn.mbta.com/MBTA_GTFS.zip",
+		ext:    "zip",
+		daily:  true,
 	},
 }
 
@@ -185,6 +209,12 @@ func cycle(ctx context.Context, lake string) {
 	start := time.Now()
 	failed := ingestAll(ctx, lake)
 
+	// Parse whatever raw snapshots don't have a bronze counterpart yet. Runs
+	// even when a feed failed: the other feeds' data is still worth parsing,
+	// and it backfills anything written before this stage existed.
+	transformBronze(ctx, lake)
+	transformGold(ctx, lake)
+
 	switch {
 	case ctx.Err() != nil:
 		slog.Info("cycle interrupted", "elapsed", time.Since(start).Round(time.Millisecond))
@@ -208,7 +238,21 @@ func runOnce() error {
 		time.Duration(len(feeds))*fetchTimeout)
 	defer cancel()
 
-	if failed := ingestAll(ctx, lake); len(failed) > 0 {
+	failed := ingestAll(ctx, lake)
+
+	// Must run here too, not just in cycle(): `-once` is the backfill path,
+	// and skipping the transform would make a manual run silently produce
+	// raw-only output.
+	//
+	// Deliberately NOT the fetch context: that one is sized for HTTP timeouts,
+	// and a first run has thousands of snapshots to catch up on. Reusing it
+	// would abort the backfill partway and look like success.
+	tctx, tcancel := context.WithTimeout(context.Background(), 30*time.Minute)
+	defer tcancel()
+	transformBronze(tctx, lake)
+	transformGold(tctx, lake)
+
+	if len(failed) > 0 {
 		return fmt.Errorf("%d feed(s) failed: %s",
 			len(failed), strings.Join(failed, ", "))
 	}
@@ -254,6 +298,9 @@ func ingestAll(ctx context.Context, lake string) []string {
 		if ctx.Err() != nil {
 			return failed
 		}
+		if f.daily && alreadyHaveToday(lake, f, now) {
+			continue
+		}
 		url := f.url
 		if f.secret != "" {
 			key, err := readSecret(f.secret)
@@ -288,8 +335,25 @@ func snapshotPath(lake string, f feed, at time.Time) (dir, file string) {
 	at = at.UTC()
 	dir = filepath.Join(lake, "raw", f.agency, f.name,
 		"dt="+at.Format("2006-01-02"))
-	file = at.Format("20060102T150405Z") + ".pb"
+	file = at.Format("20060102T150405Z") + "." + f.extension()
 	return dir, file
+}
+
+// alreadyHaveToday reports whether a daily feed has already been captured for
+// this dt= partition.
+func alreadyHaveToday(lake string, f feed, at time.Time) bool {
+	dir, _ := snapshotPath(lake, f, at)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return false
+	}
+	suffix := "." + f.extension()
+	for _, e := range entries {
+		if !e.IsDir() && strings.HasSuffix(e.Name(), suffix) {
+			return true
+		}
+	}
+	return false
 }
 
 func fetchFeed(ctx context.Context, client *http.Client, url, lake string,
