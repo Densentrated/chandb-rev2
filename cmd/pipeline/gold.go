@@ -42,18 +42,21 @@ var dtPartition = regexp.MustCompile(`^dt=\d{4}-\d{2}-\d{2}$`)
 // Re-reading the CSVs inside every partition's query was what ran the
 // container out of memory on the first full day: trips.txt is 9.8MB across 12
 // columns, re-parsed per partition, when only two columns are ever read.
-const staticLoad = `
-CREATE OR REPLACE TEMP TABLE gtfs_routes AS
+//
+// One statement per Exec, deliberately. The driver will happily accept several
+// statements in one string, but parameter binding does not survive the split —
+// it fails with "incorrect argument count for command: have 0 want 1".
+var staticLoads = []struct{ file, stmt string }{
+	{"routes.txt", `CREATE OR REPLACE TEMP TABLE gtfs_routes AS
   SELECT route_id, route_short_name, route_long_name, route_type, route_color
-  FROM read_csv(?, types={'route_id':'VARCHAR'}, quote='"', escape='"');
-
-CREATE OR REPLACE TEMP TABLE gtfs_trips AS
+  FROM read_csv(?, types={'route_id':'VARCHAR'}, quote='"', escape='"')`},
+	{"trips.txt", `CREATE OR REPLACE TEMP TABLE gtfs_trips AS
   SELECT trip_id, trip_headsign
-  FROM read_csv(?, types={'trip_id':'VARCHAR','route_id':'VARCHAR'}, quote='"', escape='"');
-
-CREATE OR REPLACE TEMP TABLE gtfs_stops AS
+  FROM read_csv(?, types={'trip_id':'VARCHAR','route_id':'VARCHAR'}, quote='"', escape='"')`},
+	{"stops.txt", `CREATE OR REPLACE TEMP TABLE gtfs_stops AS
   SELECT stop_id, stop_name, stop_lat, stop_lon
-  FROM read_csv(?, types={'stop_id':'VARCHAR'}, quote='"', escape='"');`
+  FROM read_csv(?, types={'stop_id':'VARCHAR'}, quote='"', escape='"')`},
+}
 
 // goldQuery is the transform. LEFT JOINs throughout: MBTA inserts realtime
 // "ADDED-" trips that exist in no static schedule, and dropping them would
@@ -89,7 +92,12 @@ COPY (
     s.stop_name,
     s.stop_lat,
     s.stop_lon
-  FROM read_json_auto(?) v
+  FROM read_json(?, format='newline_delimited', columns={
+        'agency':'VARCHAR','feed_timestamp':'BIGINT','vehicle_id':'VARCHAR',
+        'label':'VARCHAR','trip_id':'VARCHAR','route_id':'VARCHAR',
+        'direction_id':'BIGINT','latitude':'DOUBLE','longitude':'DOUBLE',
+        'bearing':'DOUBLE','speed_mps':'DOUBLE','stop_id':'VARCHAR',
+        'current_status':'VARCHAR','vehicle_timestamp':'BIGINT'}) v
   LEFT JOIN gtfs_routes r ON r.route_id = v.route_id
   LEFT JOIN gtfs_trips  t ON t.trip_id  = v.trip_id
   LEFT JOIN gtfs_stops  s ON s.stop_id  = v.stop_id
@@ -97,16 +105,95 @@ COPY (
   ORDER BY v.feed_timestamp, v.vehicle_id
 ) TO ? (FORMAT PARQUET, COMPRESSION ZSTD)`
 
+// stopEventsQuery answers "was it on time, and can I trust that number?".
+//
+// GTFS-RT TripUpdates are forecasts, not outcomes: a row says "we currently
+// expect this trip at this stop N seconds late". The forecast made closest to
+// the actual arrival is the best available proxy for what happened, and
+// agencies drop a stop from the feed once it has been served. So the LAST
+// prediction we observed for each (trip, stop) is the one worth keeping.
+//
+// That dedupe is also what bounds storage. The row count here is set by how
+// many stop events the timetable actually contains, not by how often we poll,
+// so sampling faster buys accuracy without growing this table.
+//
+// The JSON schema is pinned rather than sniffed. Bronze rows use omitempty, so
+// an absent field is simply missing from the line — and read_json_auto then
+// never creates the column. BART emits no stop_sequence at all, so sniffing
+// produced a table without it and the query failed to bind. Declaring the
+// columns makes the shape independent of what any one day happened to contain.
+//
+// lead_time_s is the honesty column: seconds between the final prediction and
+// the predicted arrival. Small means the forecast was made near the event and
+// the delay figure is trustworthy; large means we sampled too slowly to know.
+// Filter on it rather than assuming every row is equally good.
+const stopEventsQuery = `
+COPY (
+  WITH ranked AS (
+    SELECT *,
+      row_number() OVER (PARTITION BY trip_id, stop_id, stop_sequence
+                         ORDER BY feed_timestamp DESC)   AS rn,
+      count(*)     OVER (PARTITION BY trip_id, stop_id, stop_sequence) AS observations
+    FROM read_json(?, format='newline_delimited', columns={
+          'agency':'VARCHAR','feed_timestamp':'BIGINT','trip_id':'VARCHAR',
+          'route_id':'VARCHAR','direction_id':'BIGINT','vehicle_id':'VARCHAR',
+          'stop_id':'VARCHAR','stop_sequence':'BIGINT',
+          'arrival_time':'BIGINT','arrival_delay':'BIGINT',
+          'departure_time':'BIGINT','departure_delay':'BIGINT',
+          'schedule_relationship':'VARCHAR'})
+  )
+  SELECT
+    u.agency,
+    u.trip_id,
+    u.route_id,
+    r.route_short_name,
+    r.route_long_name,
+    r.route_type,
+    t.trip_headsign,
+    u.direction_id,
+    u.vehicle_id,
+    u.stop_id,
+    s.stop_name,
+    s.stop_lat,
+    s.stop_lon,
+    u.stop_sequence,
+    u.arrival_time,
+    u.arrival_delay,
+    u.departure_time,
+    u.departure_delay,
+    u.schedule_relationship,
+    u.feed_timestamp                   AS last_seen,
+    to_timestamp(u.feed_timestamp)     AS last_seen_time,
+    u.observations,
+    u.arrival_time - u.feed_timestamp  AS lead_time_s
+  FROM ranked u
+  LEFT JOIN gtfs_routes r ON r.route_id = u.route_id
+  LEFT JOIN gtfs_trips  t ON t.trip_id  = u.trip_id
+  LEFT JOIN gtfs_stops  s ON s.stop_id  = u.stop_id
+  WHERE u.rn = 1
+  ORDER BY u.route_id, u.trip_id, u.stop_sequence
+) TO ? (FORMAT PARQUET, COMPRESSION ZSTD)`
+
+// goldTable is one derived dataset: a bronze source and the SQL that shapes it.
+type goldTable struct {
+	agency string
+	source string // bronze table name
+	out    string // gold table name
+	query  string
+}
+
+var goldTables = []goldTable{
+	{agency: "mbta", source: "vehicle_positions", out: "vehicle_positions", query: goldQuery},
+	{agency: "mbta", source: "trip_updates", out: "stop_events", query: stopEventsQuery},
+	// BART publishes no vehicle positions, so its TripUpdates are the only
+	// signal about where its trains are and whether they are late.
+	{agency: "bart", source: "trip_updates", out: "stop_events", query: stopEventsQuery},
+}
+
 func transformGold(ctx context.Context, lake string) {
 	staticDir, err := latestStaticDir(lake)
 	if err != nil {
 		slog.Debug("gold skipped, no static GTFS yet", "err", err)
-		return
-	}
-
-	srcRoot := filepath.Join(lake, "bronze", "mbta", "vehicle_positions")
-	parts, err := os.ReadDir(srcRoot)
-	if err != nil {
 		return
 	}
 
@@ -126,33 +213,43 @@ func transformGold(ctx context.Context, lake string) {
 	var built int
 	start := time.Now()
 
-	for _, p := range parts {
-		if ctx.Err() != nil {
-			return
-		}
-		name := p.Name()
-		if !p.IsDir() || !dtPartition.MatchString(name) {
-			continue
+	for _, tbl := range goldTables {
+		srcRoot := filepath.Join(lake, "bronze", tbl.agency, tbl.source)
+		parts, err := os.ReadDir(srcRoot)
+		if err != nil {
+			continue // that bronze table has not been produced yet
 		}
 
-		outDir := filepath.Join(lake, "gold", "mbta", "vehicle_positions", name)
-		outFile := filepath.Join(outDir, "part-0.parquet")
+		for _, p := range parts {
+			if ctx.Err() != nil {
+				return
+			}
+			name := p.Name()
+			if !p.IsDir() || !dtPartition.MatchString(name) {
+				continue
+			}
 
-		// Past days are complete, so a existing file is final. Today's is
-		// still accumulating snapshots, so rebuild it every cycle.
-		if _, err := os.Stat(outFile); err == nil && name != today {
-			continue
-		}
-		if err := os.MkdirAll(outDir, 0o755); err != nil {
-			slog.Warn("gold mkdir failed", "dir", outDir, "err", err)
-			continue
-		}
+			outDir := filepath.Join(lake, "gold", tbl.agency, tbl.out, name)
+			outFile := filepath.Join(outDir, "part-0.parquet")
 
-		if err := buildGoldPartition(ctx, db, srcRoot, name, outFile); err != nil {
-			slog.Warn("gold partition failed", "partition", name, "err", err)
-			continue
+			// Past days are complete, so an existing file is final. Today's is
+			// still accumulating snapshots, so rebuild it every cycle.
+			if _, err := os.Stat(outFile); err == nil && name != today {
+				continue
+			}
+			if err := os.MkdirAll(outDir, 0o755); err != nil {
+				slog.Warn("gold mkdir failed", "dir", outDir, "err", err)
+				continue
+			}
+
+			if err := buildGoldPartition(ctx, db, tbl.query,
+				filepath.Join(srcRoot, name, "*.ndjson"), outFile); err != nil {
+				slog.Warn("gold partition failed",
+					"table", tbl.agency+"/"+tbl.out, "partition", name, "err", err)
+				continue
+			}
+			built++
 		}
-		built++
 	}
 
 	if built > 0 {
@@ -164,17 +261,15 @@ func transformGold(ctx context.Context, lake string) {
 }
 
 func buildGoldPartition(ctx context.Context, db *sql.DB,
-	srcRoot, partition, outFile string) error {
+	query, srcGlob, outFile string) error {
 	// COPY ... TO cannot be parameterised, so it is built by hand. Safe here
 	// because the partition name is regex-validated above and every other
 	// component is a constant: this code never sees user input. The portal,
 	// which does, must never allow COPY at all.
 	tmp := outFile + ".partial"
-	q := strings.Replace(goldQuery, ") TO ?", ") TO '"+tmp+"'", 1)
+	q := strings.Replace(query, ") TO ?", ") TO '"+tmp+"'", 1)
 
-	if _, err := db.ExecContext(ctx, q,
-		filepath.Join(srcRoot, partition, "*.ndjson"),
-	); err != nil {
+	if _, err := db.ExecContext(ctx, q, srcGlob); err != nil {
 		_ = os.Remove(tmp)
 		return err
 	}
@@ -184,12 +279,13 @@ func buildGoldPartition(ctx context.Context, db *sql.DB,
 // loadStatic materialises the narrowed GTFS lookup tables once per run, so
 // each partition joins against in-memory tables instead of re-parsing CSV.
 func loadStatic(ctx context.Context, db *sql.DB, staticDir string) error {
-	_, err := db.ExecContext(ctx, staticLoad,
-		filepath.Join(staticDir, "routes.txt"),
-		filepath.Join(staticDir, "trips.txt"),
-		filepath.Join(staticDir, "stops.txt"),
-	)
-	return err
+	for _, l := range staticLoads {
+		if _, err := db.ExecContext(ctx, l.stmt,
+			filepath.Join(staticDir, l.file)); err != nil {
+			return fmt.Errorf("load %s: %w", l.file, err)
+		}
+	}
+	return nil
 }
 
 func openDuckDB() (*sql.DB, error) {

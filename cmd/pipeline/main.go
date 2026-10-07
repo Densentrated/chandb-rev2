@@ -214,6 +214,9 @@ func cycle(ctx context.Context, lake string) {
 	// and it backfills anything written before this stage existed.
 	transformBronze(ctx, lake)
 	transformGold(ctx, lake)
+	// Strictly after the transforms: pruning raw that has not reached gold
+	// would discard it permanently.
+	prune(ctx, lake)
 
 	switch {
 	case ctx.Err() != nil:
@@ -251,6 +254,7 @@ func runOnce() error {
 	defer tcancel()
 	transformBronze(tctx, lake)
 	transformGold(tctx, lake)
+	prune(tctx, lake)
 
 	if len(failed) > 0 {
 		return fmt.Errorf("%d feed(s) failed: %s",

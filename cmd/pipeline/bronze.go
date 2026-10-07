@@ -80,6 +80,11 @@ func transformBronze(ctx context.Context, lake string) {
 	var done, skipped, failed int
 	start := time.Now()
 
+	// Bronze expires sooner than raw. Without this, every cycle would re-derive
+	// bronze for days the pruner just deleted, forever.
+	bronzeCutoff := time.Now().UTC().AddDate(0, 0,
+		-retentionDays("BRONZE_RETENTION_DAYS", defaultBronzeRetentionDays))
+
 	err := filepath.WalkDir(rawRoot, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
@@ -101,6 +106,9 @@ func transformBronze(ctx context.Context, lake string) {
 			return nil
 		}
 		if !strings.HasSuffix(path, ".pb") {
+			return nil
+		}
+		if expiredPartition(path, bronzeCutoff) {
 			return nil
 		}
 
@@ -133,6 +141,19 @@ func transformBronze(ctx context.Context, lake string) {
 			"written", done, "already_present", skipped, "failed", failed,
 			"elapsed", time.Since(start).Round(time.Millisecond))
 	}
+}
+
+// expiredPartition reports whether a file sits in a dt= partition older than
+// the cutoff. Paths without a recognisable partition are never skipped.
+func expiredPartition(path string, cutoff time.Time) bool {
+	for _, seg := range strings.Split(filepath.ToSlash(path), "/") {
+		if !dtPartition.MatchString(seg) {
+			continue
+		}
+		day, err := time.Parse("2006-01-02", seg[len("dt="):])
+		return err == nil && day.Before(cutoff)
+	}
+	return false
 }
 
 // bronzePath maps a raw snapshot to its bronze output, preserving the
