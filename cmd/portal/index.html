@@ -1,0 +1,257 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>chandb — transit data</title>
+<style>
+  :root {
+    --bg: #0f1115; --panel: #171a21; --line: #272b35;
+    --fg: #e6e8ee; --muted: #8b93a7; --accent: #6ea8fe; --warn: #e5a94f;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--fg);
+    font: 15px/1.5 system-ui, -apple-system, sans-serif;
+  }
+  header { padding: 20px 24px 12px; border-bottom: 1px solid var(--line); }
+  h1 { margin: 0 0 4px; font-size: 18px; font-weight: 600; }
+  .sub { color: var(--muted); font-size: 13px; }
+  main { padding: 20px 24px 48px; max-width: 1200px; }
+  #status {
+    margin-bottom: 14px; padding: 8px 12px; border-radius: 6px;
+    background: var(--panel); border: 1px solid var(--line);
+    font: 12px/1.4 var(--mono); color: var(--muted);
+  }
+  #status.err { color: #ff8e8e; border-color: #5a2b2b; }
+  textarea {
+    width: 100%; min-height: 110px; padding: 12px; resize: vertical;
+    background: var(--panel); color: var(--fg);
+    border: 1px solid var(--line); border-radius: 6px;
+    font: 13px/1.5 var(--mono); tab-size: 2;
+  }
+  textarea:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+  .row { display: flex; gap: 10px; align-items: center; margin: 10px 0 18px; flex-wrap: wrap; }
+  button {
+    padding: 8px 16px; border-radius: 6px; cursor: pointer;
+    background: var(--accent); color: #0b1020; border: 0;
+    font-weight: 600; font-size: 13px;
+  }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  .hint { color: var(--muted); font-size: 12px; }
+  .examples { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 14px; }
+  .examples button {
+    background: var(--panel); color: var(--muted); font-weight: 400;
+    border: 1px solid var(--line); font-size: 12px; padding: 5px 10px;
+  }
+  .examples button:hover { color: var(--fg); border-color: var(--accent); }
+  .wrap { overflow: auto; border: 1px solid var(--line); border-radius: 6px; max-height: 60vh; }
+  table { border-collapse: collapse; width: 100%; font: 12px/1.45 var(--mono); }
+  th, td { padding: 6px 10px; text-align: left; white-space: nowrap;
+           border-bottom: 1px solid var(--line); }
+  th { position: sticky; top: 0; background: var(--panel); color: var(--muted);
+       font-weight: 600; z-index: 1; }
+  td.null { color: #5a6072; font-style: italic; }
+  td.num { text-align: right; }
+  footer { margin-top: 24px; color: var(--muted); font-size: 12px; }
+  a { color: var(--accent); }
+</style>
+</head>
+<body>
+<header>
+  <h1>chandb — MBTA vehicle positions</h1>
+  <div class="sub">
+    Snapshots every 30 minutes, joined against static GTFS.
+    <strong>Queries run in your browser</strong> — DuckDB-WASM reads Parquet
+    straight off this server over HTTP range requests. Nothing is sent back.
+  </div>
+</header>
+
+<main>
+  <div id="status">booting DuckDB-WASM…</div>
+
+  <div class="examples" id="examples"></div>
+
+  <textarea id="sql" spellcheck="false"></textarea>
+  <div class="row">
+    <button id="run" disabled>Run query</button>
+    <span class="hint">Ctrl/⌘ + Enter</span>
+    <span class="hint" id="timing"></span>
+  </div>
+
+  <div class="wrap"><table id="out"></table></div>
+
+  <footer>
+    Raw GTFS-Realtime protobuf is archived unparsed; this table is the gold
+    layer — one compacted Parquet file per day.
+    <a href="/api/datasets">/api/datasets</a>
+  </footer>
+</main>
+
+<script type="module">
+import * as duckdb from 'https://cdn.jsdelivr.net/npm/@duckdb/duckdb-wasm@1.32.0/+esm';
+
+const $ = (id) => document.getElementById(id);
+const statusEl = $('status'), sqlEl = $('sql'), runEl = $('run'),
+      outEl = $('out'), timingEl = $('timing');
+
+const say = (msg, isErr = false) => {
+  statusEl.textContent = msg;
+  statusEl.classList.toggle('err', isErr);
+};
+
+const EXAMPLES = {
+  'Where are the trains now?': `SELECT route_short_name, trip_headsign, current_status,
+       round(latitude, 4)  AS lat,
+       round(longitude, 4) AS lon,
+       stop_name
+FROM vehicles
+WHERE feed_time = (SELECT max(feed_time) FROM vehicles)
+ORDER BY route_type, route_short_name
+LIMIT 100;`,
+
+  'Busiest routes': `SELECT route_short_name, route_long_name,
+       count(DISTINCT vehicle_id) AS vehicles,
+       count(*)                   AS observations
+FROM vehicles
+WHERE route_short_name IS NOT NULL
+GROUP BY 1, 2
+ORDER BY vehicles DESC
+LIMIT 25;`,
+
+  'Vehicles over time': `SELECT feed_time, count(*) AS vehicles
+FROM vehicles
+GROUP BY 1
+ORDER BY 1 DESC
+LIMIT 48;`,
+
+  'Fastest moving': `SELECT route_short_name, vehicle_id, trip_headsign,
+       round(speed_mps * 2.23694, 1) AS mph,
+       round(latitude, 4) AS lat, round(longitude, 4) AS lon
+FROM vehicles
+WHERE speed_mps IS NOT NULL
+ORDER BY speed_mps DESC
+LIMIT 25;`,
+
+  'Schema': `DESCRIBE SELECT * FROM vehicles;`,
+};
+
+function renderExamples() {
+  const box = $('examples');
+  for (const [label, q] of Object.entries(EXAMPLES)) {
+    const b = document.createElement('button');
+    b.textContent = label;
+    b.onclick = () => { sqlEl.value = q; run(); };
+    box.appendChild(b);
+  }
+}
+
+// Build the worker from a blob so the CDN script isn't loaded cross-origin
+// as a worker, which browsers refuse.
+async function boot() {
+  const bundles = duckdb.getJsDelivrBundles();
+  const bundle = await duckdb.selectBundle(bundles);
+  const workerURL = URL.createObjectURL(new Blob(
+    [`importScripts("${bundle.mainWorker}");`], { type: 'text/javascript' }));
+
+  const db = new duckdb.AsyncDuckDB(new duckdb.ConsoleLogger(), new Worker(workerURL));
+  await db.instantiate(bundle.mainModule, bundle.pthreadWorker);
+  URL.revokeObjectURL(workerURL);
+  return db;
+}
+
+let conn;
+
+async function init() {
+  try {
+    const db = await boot();
+    conn = await db.connect();
+
+    say('loading dataset index…');
+    const sets = await (await fetch('/api/datasets')).json();
+    const vp = sets.find(s => s.name === 'mbta_vehicle_positions');
+    if (!vp || !vp.files.length) {
+      say('No gold data published yet. The pipeline writes it on its next cycle.', true);
+      return;
+    }
+
+    // Register each partition by URL. DuckDB-WASM issues HTTP range requests,
+    // so a selective query fetches only the row groups it needs rather than
+    // the whole file.
+    const names = [];
+    for (const url of vp.files) {
+      const name = url.replace(/^\/data\//, '').replace(/\//g, '_');
+      await db.registerFileURL(name, new URL(url, location.href).href,
+                               duckdb.DuckDBDataProtocol.HTTP, false);
+      names.push(name);
+    }
+    const list = names.map(n => `'${n}'`).join(', ');
+    await conn.query(`CREATE OR REPLACE VIEW vehicles AS
+                      SELECT * FROM read_parquet([${list}])`);
+
+    const mb = (vp.bytes / 1048576).toFixed(1);
+    say(`ready — ${names.length} daily partition(s), ${mb} MB, queried in your browser`);
+    runEl.disabled = false;
+    sqlEl.value = Object.values(EXAMPLES)[0];
+    await run();
+  } catch (e) {
+    say('failed to start: ' + e, true);
+    console.error(e);
+  }
+}
+
+function cell(v) {
+  const td = document.createElement('td');
+  if (v === null || v === undefined) { td.textContent = 'NULL'; td.className = 'null'; return td; }
+  if (typeof v === 'bigint') { td.textContent = v.toString(); td.className = 'num'; return td; }
+  if (typeof v === 'number') { td.textContent = String(v); td.className = 'num'; return td; }
+  // textContent, never innerHTML: route and stop names are upstream data and
+  // must never be able to inject markup into this page.
+  td.textContent = String(v);
+  return td;
+}
+
+async function run() {
+  if (!conn) return;
+  runEl.disabled = true;
+  timingEl.textContent = '';
+  const t0 = performance.now();
+  try {
+    const res = await conn.query(sqlEl.value);
+    const rows = res.toArray();
+    const cols = res.schema.fields.map(f => f.name);
+
+    outEl.replaceChildren();
+    const thead = outEl.createTHead().insertRow();
+    for (const c of cols) {
+      const th = document.createElement('th');
+      th.textContent = c;
+      thead.appendChild(th);
+    }
+    const tbody = outEl.createTBody();
+    for (const r of rows) {
+      const tr = tbody.insertRow();
+      const o = r.toJSON();
+      for (const c of cols) tr.appendChild(cell(o[c]));
+    }
+    timingEl.textContent =
+      `${rows.length} row(s) in ${(performance.now() - t0).toFixed(0)} ms`;
+    statusEl.classList.remove('err');
+  } catch (e) {
+    say(String(e), true);
+  } finally {
+    runEl.disabled = false;
+  }
+}
+
+runEl.onclick = run;
+sqlEl.addEventListener('keydown', (e) => {
+  if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') { e.preventDefault(); run(); }
+});
+
+renderExamples();
+init();
+</script>
+</body>
+</html>

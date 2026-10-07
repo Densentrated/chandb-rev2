@@ -66,12 +66,38 @@ jobs:
           chmod 644 ~/.ssh/known_hosts
 
       # --delete is what enforces "nothing on the VPS is hand-edited".
+      #
+      # secrets/ MUST be excluded. It is created by Ansible and populated by
+      # the next step, not from the repo — so --delete would wipe it on every
+      # deploy, and Docker would then recreate it root:root 0755 when mounting
+      # the volume. That silently destroys every stored credential and makes
+      # the directory world-readable.
       - name: Sync deploy manifests
         run: |
-          rsync -az --delete \
+          rsync -az --delete --exclude 'secrets/' \
             -e "ssh -i ~/.ssh/id_ed25519" \
             deploy/ \
             ${{ vars.SSH_USER }}@${{ secrets.SSH_HOST }}:/opt/chandb/
+
+      # Ingest credentials land as FILES, never env vars: DuckDB can read
+      # /proc/self/environ, so anything in the portal's environment is one
+      # query away from being public.
+      #
+      # 0640 and group `portal` (inherited via the directory's setgid bit) is
+      # what lets uid 10001 in the container read them while nobody else can.
+      # Writing an empty secret is skipped so an unset optional key doesn't
+      # create a file that looks present but isn't usable.
+      - name: Install ingest secrets
+        env:
+          API_511: ${{ secrets.API_511_KEY }}
+        run: |
+          if [ -z "$API_511" ]; then
+            echo "::notice::API_511_KEY not set - BART vehicle positions will be skipped"
+            exit 0
+          fi
+          printf '%s\n' "$API_511" | ssh -i ~/.ssh/id_ed25519 \
+            ${{ vars.SSH_USER }}@${{ secrets.SSH_HOST }} \
+            'umask 027 && cat > /opt/chandb/secrets/511_api_key'
 
       # Written over stdin so the tunnel token never lands in the VPS process
       # list or shell history. EOF must sit at the same indent as the other
