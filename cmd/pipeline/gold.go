@@ -36,12 +36,31 @@ import (
 // statement, and "it can't happen" is how injection bugs start.
 var dtPartition = regexp.MustCompile(`^dt=\d{4}-\d{2}-\d{2}$`)
 
+// staticLoad narrows each GTFS table to the columns gold actually uses and
+// materialises it once per run.
+//
+// Re-reading the CSVs inside every partition's query was what ran the
+// container out of memory on the first full day: trips.txt is 9.8MB across 12
+// columns, re-parsed per partition, when only two columns are ever read.
+const staticLoad = `
+CREATE OR REPLACE TEMP TABLE gtfs_routes AS
+  SELECT route_id, route_short_name, route_long_name, route_type, route_color
+  FROM read_csv(?, types={'route_id':'VARCHAR'}, quote='"', escape='"');
+
+CREATE OR REPLACE TEMP TABLE gtfs_trips AS
+  SELECT trip_id, trip_headsign
+  FROM read_csv(?, types={'trip_id':'VARCHAR','route_id':'VARCHAR'}, quote='"', escape='"');
+
+CREATE OR REPLACE TEMP TABLE gtfs_stops AS
+  SELECT stop_id, stop_name, stop_lat, stop_lon
+  FROM read_csv(?, types={'stop_id':'VARCHAR'}, quote='"', escape='"');`
+
 // goldQuery is the transform. LEFT JOINs throughout: MBTA inserts realtime
 // "ADDED-" trips that exist in no static schedule, and dropping them would
 // silently lose exactly the unusual service worth looking at.
 //
-// Every GTFS id is forced to VARCHAR. They look numeric and mostly are, so
-// type sniffing guesses INT64 and then fails on the first ADDED- trip id.
+// Every GTFS id above is forced to VARCHAR. They look numeric and mostly are,
+// so type sniffing guesses INT64 and then fails on the first ADDED- trip id.
 // quote/escape must be given explicitly too: supplying `types` disables the
 // dialect sniffer, and headsigns like "Burlington via Medford Square, West
 // Cummings" contain commas.
@@ -71,12 +90,9 @@ COPY (
     s.stop_lat,
     s.stop_lon
   FROM read_json_auto(?) v
-  LEFT JOIN read_csv(?, types={'route_id':'VARCHAR'}, quote='"', escape='"') r
-    ON r.route_id = v.route_id
-  LEFT JOIN read_csv(?, types={'trip_id':'VARCHAR','route_id':'VARCHAR'}, quote='"', escape='"') t
-    ON t.trip_id = v.trip_id
-  LEFT JOIN read_csv(?, types={'stop_id':'VARCHAR'}, quote='"', escape='"') s
-    ON s.stop_id = v.stop_id
+  LEFT JOIN gtfs_routes r ON r.route_id = v.route_id
+  LEFT JOIN gtfs_trips  t ON t.trip_id  = v.trip_id
+  LEFT JOIN gtfs_stops  s ON s.stop_id  = v.stop_id
   WHERE v.latitude IS NOT NULL
   ORDER BY v.feed_timestamp, v.vehicle_id
 ) TO ? (FORMAT PARQUET, COMPRESSION ZSTD)`
@@ -100,6 +116,11 @@ func transformGold(ctx context.Context, lake string) {
 		return
 	}
 	defer func() { _ = db.Close() }()
+
+	if err := loadStatic(ctx, db, staticDir); err != nil {
+		slog.Warn("gold skipped, static tables would not load", "err", err)
+		return
+	}
 
 	today := "dt=" + time.Now().UTC().Format("2006-01-02")
 	var built int
@@ -127,7 +148,7 @@ func transformGold(ctx context.Context, lake string) {
 			continue
 		}
 
-		if err := buildGoldPartition(ctx, db, srcRoot, name, staticDir, outFile); err != nil {
+		if err := buildGoldPartition(ctx, db, srcRoot, name, outFile); err != nil {
 			slog.Warn("gold partition failed", "partition", name, "err", err)
 			continue
 		}
@@ -143,7 +164,7 @@ func transformGold(ctx context.Context, lake string) {
 }
 
 func buildGoldPartition(ctx context.Context, db *sql.DB,
-	srcRoot, partition, staticDir, outFile string) error {
+	srcRoot, partition, outFile string) error {
 	// COPY ... TO cannot be parameterised, so it is built by hand. Safe here
 	// because the partition name is regex-validated above and every other
 	// component is a constant: this code never sees user input. The portal,
@@ -153,14 +174,22 @@ func buildGoldPartition(ctx context.Context, db *sql.DB,
 
 	if _, err := db.ExecContext(ctx, q,
 		filepath.Join(srcRoot, partition, "*.ndjson"),
-		filepath.Join(staticDir, "routes.txt"),
-		filepath.Join(staticDir, "trips.txt"),
-		filepath.Join(staticDir, "stops.txt"),
 	); err != nil {
 		_ = os.Remove(tmp)
 		return err
 	}
 	return os.Rename(tmp, outFile)
+}
+
+// loadStatic materialises the narrowed GTFS lookup tables once per run, so
+// each partition joins against in-memory tables instead of re-parsing CSV.
+func loadStatic(ctx context.Context, db *sql.DB, staticDir string) error {
+	_, err := db.ExecContext(ctx, staticLoad,
+		filepath.Join(staticDir, "routes.txt"),
+		filepath.Join(staticDir, "trips.txt"),
+		filepath.Join(staticDir, "stops.txt"),
+	)
+	return err
 }
 
 func openDuckDB() (*sql.DB, error) {
@@ -174,6 +203,7 @@ func openDuckDB() (*sql.DB, error) {
 	for _, pragma := range []string{
 		"SET memory_limit='256MB'",
 		"SET threads=2",
+		"SET preserve_insertion_order=false",
 		"SET temp_directory='/tmp'",
 		"SET max_temp_directory_size='48MB'",
 	} {

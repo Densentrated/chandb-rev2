@@ -109,5 +109,8 @@ func extractMember(f *zip.File, outFile string) error {
 		return fmt.Errorf("%s hit the %d byte decompression cap",
 			f.Name, maxStaticMemberBytes)
 	}
+	if err := os.Chmod(tmpName, 0o644); err != nil {
+		return err
+	}
 	return os.Rename(tmpName, outFile)
 }

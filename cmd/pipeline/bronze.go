@@ -315,5 +315,8 @@ func writeNDJSON(outFile string, rows []any) error {
 	if err := tmp.Close(); err != nil {
 		return err
 	}
+	if err := os.Chmod(tmpName, 0o644); err != nil {
+		return err
+	}
 	return os.Rename(tmpName, outFile)
 }

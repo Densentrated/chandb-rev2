@@ -400,6 +400,11 @@ func fetchFeed(ctx context.Context, client *http.Client, url, lake string,
 	if n == 0 {
 		return "", 0, errors.New("empty response body")
 	}
+	// CreateTemp makes 0600. This data is public and operators need to read
+	// it; 0600 only blocks debugging without protecting anything.
+	if err := os.Chmod(tmpName, 0o644); err != nil {
+		return "", 0, err
+	}
 
 	final := filepath.Join(dir, name)
 	if err := os.Rename(tmpName, final); err != nil {
