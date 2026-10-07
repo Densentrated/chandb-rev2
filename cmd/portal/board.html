@@ -39,7 +39,13 @@
            grid-template-columns: repeat(auto-fill, minmax(340px, 1fr)); }
   .station { background: var(--panel); border: 1px solid var(--line);
              border-radius: 8px; padding: 12px 14px; }
-  .station h2 { margin: 0 0 8px; font-size: 14px; font-weight: 600; }
+  .station h2 { margin: 0 0 8px; font-size: 14px; font-weight: 600;
+                display: flex; justify-content: space-between; gap: 8px; align-items: baseline; }
+  .agency { font: 600 10px/1 var(--mono); color: var(--muted);
+            border: 1px solid var(--line); border-radius: 4px;
+            padding: 3px 5px; letter-spacing: .04em; flex: none; }
+  .agencies { display: inline-flex; gap: 6px; }
+  .agencies button.on { color: var(--fg); border-color: var(--accent); }
   .dep { display: grid; grid-template-columns: 24px minmax(0,1fr) auto;
          gap: 10px; align-items: baseline; padding: 5px 0;
          border-top: 1px solid var(--line); font-size: 13px; }
@@ -55,7 +61,7 @@
 <header>
   <h1>chandb — departure board</h1>
   <div class="sub">
-    Next arrivals per station, from the gold layer.
+    Next arrivals per station across every agency in the lake.
     <a href="/">SQL viewer →</a>
   </div>
 </header>
@@ -64,9 +70,10 @@
   <div id="status">booting DuckDB-WASM…</div>
 
   <div class="controls">
-    <input type="search" id="filter" placeholder="Filter stations… e.g. Government, Symphony">
+    <input type="search" id="filter" placeholder="Filter stations… e.g. Government, Embarcadero">
     <button id="tmode" type="button">Times: human-readable</button>
     <button id="reload" type="button">Refresh</button>
+    <span id="agencies" class="agencies"></span>
   </div>
 
   <div class="board" id="board"></div>
@@ -84,50 +91,85 @@ const say = (msg, isErr = false) => {
 };
 
 let conn, rows = [], human = true;
+let agencies = [], agencyFilter = null;   // null = show every agency
+
+function renderAgencyFilter() {
+  const box = $('agencies');
+  box.replaceChildren();
+  if (agencies.length < 2) return;        // pointless with a single agency
+
+  for (const a of [null, ...agencies]) {
+    const b = document.createElement('button');
+    b.textContent = a === null ? 'All' : a.toUpperCase();
+    b.className = agencyFilter === a ? 'on' : '';
+    b.onclick = () => { agencyFilter = a; renderAgencyFilter(); render(); };
+    box.appendChild(b);
+  }
+}
 
 // "now" is the newest timestamp in the data, not the browser clock. Snapshots
 // are up to one ingest interval old, so counting down from wall-clock time
 // would show every departure as long gone.
-const SQL = (table, cols) => `
-WITH now AS (SELECT max(last_seen) AS t FROM ${table})
-SELECT stop_name,
+// One SELECT per agency, UNIONed.
+//
+// "now" is computed PER TABLE, not once across the union: each agency's feed
+// has its own latest timestamp, and sharing one would make the agency that
+// happened to be fetched a minute earlier look uniformly late.
+const agencySQL = (table, cols) => `
+SELECT '${table.split('_')[0]}' AS agency,
+       stop_name,
        coalesce(route_short_name, route_long_name, route_id) AS route,
        ${cols.has('vehicle_type') ? 'vehicle_type' : 'NULL AS vehicle_type'},
        ${cols.has('route_type')   ? 'route_type'   : 'NULL AS route_type'},
        trip_headsign,
        arrival_time,
-       arrival_time - (SELECT t FROM now) AS seconds_away
+       arrival_time - (SELECT max(last_seen) FROM ${table}) AS seconds_away
 FROM ${table}
-WHERE stop_name   IS NOT NULL
+WHERE stop_name    IS NOT NULL
   AND arrival_time IS NOT NULL
-  AND arrival_time BETWEEN (SELECT t FROM now) - 600
-                       AND (SELECT t FROM now) + 3600
-ORDER BY stop_name, arrival_time`;
+  AND arrival_time BETWEEN (SELECT max(last_seen) FROM ${table}) - 600
+                       AND (SELECT max(last_seen) FROM ${table}) + 3600`;
+
+// MBTA alone publishes ~5,800 stops. Rendering a card for every one is tens
+// of thousands of DOM nodes and a visibly janky page, so the board shows a
+// window and the filter box is how you narrow it.
+const MAX_STATIONS = 60;
 
 function render() {
   const q = filterEl.value.trim().toLowerCase();
   const byStop = new Map();
 
   for (const r of rows) {
+    if (agencyFilter && r.agency !== agencyFilter) continue;
     if (q && !r.stop_name.toLowerCase().includes(q)) continue;
-    if (!byStop.has(r.stop_name)) byStop.set(r.stop_name, []);
-    const list = byStop.get(r.stop_name);
+    // Keyed by agency too: "Civic Center" exists in more than one transit
+    // system, and merging them into one card would be a lie.
+    const key = r.agency + '\u0000' + r.stop_name;
+    if (!byStop.has(key)) byStop.set(key, []);
+    const list = byStop.get(key);
     if (list.length < 6) list.push(r); // a board shows the next few, not all
   }
 
+  const total = byStop.size;
   boardEl.replaceChildren();
-  if (!byStop.size) {
+  if (!total) {
     say(q ? `No stations matching "${filterEl.value}".`
           : 'No upcoming arrivals in the latest snapshot.');
     return;
   }
 
-  for (const [stop, deps] of byStop) {
+  let drawn = 0;
+  for (const [, deps] of byStop) {
+    if (drawn++ >= MAX_STATIONS) break;
     const card = document.createElement('section');
     card.className = 'station';
 
     const h = document.createElement('h2');
-    h.textContent = stop;                 // textContent: upstream names, never innerHTML
+    h.textContent = deps[0].stop_name;    // textContent: upstream names, never innerHTML
+    const badge = document.createElement('span');
+    badge.className = 'agency';
+    badge.textContent = deps[0].agency.toUpperCase();
+    h.appendChild(badge);
     card.appendChild(h);
 
     for (const d of deps) {
@@ -160,20 +202,30 @@ function render() {
     boardEl.appendChild(card);
   }
 
-  const shown = [...byStop.values()].reduce((n, l) => n + l.length, 0);
-  say(`${byStop.size} station(s), ${shown} departure(s) — queried in your browser`);
+  const who = agencyFilter ? agencyFilter.toUpperCase()
+                           : agencies.map(a => a.toUpperCase()).join(' + ');
+  say(total > MAX_STATIONS
+    ? `${who} · showing ${MAX_STATIONS} of ${total} stations — type in the filter to narrow`
+    : `${who} · ${total} station(s) — queried in your browser`);
 }
 
 async function load() {
-  const table = ['mbta_stop_events', 'bart_stop_events']
-    .find(t => available.has(t));
-  if (!table) {
+  const tables = [...available].filter(t => t.endsWith('_stop_events')).sort();
+  if (!tables.length) {
     say('No stop_events table published yet. The pipeline writes it on its next cycle.', true);
     return;
   }
-  const cols = await columnsOf(conn, table);
-  const res = await conn.query(SQL(table, cols));
+
+  const parts = [];
+  for (const t of tables) {
+    parts.push(agencySQL(t, await columnsOf(conn, t)));
+  }
+  const res = await conn.query(
+    parts.join('\nUNION ALL\n') + '\nORDER BY agency, stop_name, arrival_time');
+
   rows = res.toArray().map(r => r.toJSON());
+  agencies = [...new Set(rows.map(r => r.agency))].sort();
+  renderAgencyFilter();
   render();
 }
 
