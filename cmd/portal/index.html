@@ -95,7 +95,7 @@
 </main>
 
 <script type="module">
-import { boot, columnsOf, INSTANT_COLS, DURATION_COLS, fmtInstant, fmtDuration } from '/chandb.js';
+import { boot, columnsOf, INSTANT_COLS, DURATION_COLS, fmtInstant, fmtDuration, fmtMB } from '/chandb.js';
 
 const $ = (id) => document.getElementById(id);
 const statusEl = $('status'), sqlEl = $('sql'), runEl = $('run'),
@@ -247,7 +247,11 @@ let conn;
 
 async function init() {
   try {
-    const ctx = await boot();
+    const ctx = await boot((loaded, total) => {
+      say(loaded < 0
+        ? 'engine ready — registering datasets…'
+        : `downloading DuckDB engine… ${fmtMB(loaded)} / ${fmtMB(total)} MB (one-time, then cached)`);
+    });
     conn = ctx.conn;
     for (const name of ctx.available) {
       available.add(name);
@@ -260,7 +264,8 @@ async function init() {
     renderExamples();
 
     const mb = (ctx.bytes / 1048576).toFixed(1);
-    say(`ready — ${[...available].join(', ')} · ${ctx.files} partition(s), ${mb} MB, queried in your browser`);
+    say(`ready — ${[...available].join(', ')} · ${ctx.files} partition(s), ${mb} MB`
+      + ` · engine ${(ctx.timings.engineMs / 1000).toFixed(1)}s, data ${(ctx.timings.datasetsMs / 1000).toFixed(1)}s`);
     runEl.disabled = false;
     sqlEl.value = (EXAMPLES.find(e => available.has(e.table)) || EXAMPLES[0]).sql;
     await run();

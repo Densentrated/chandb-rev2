@@ -80,7 +80,7 @@
 </main>
 
 <script type="module">
-import { boot, columnsOf, fmtEta, vehicleIcon, typeFromRouteType } from '/chandb.js';
+import { boot, columnsOf, fmtEta, vehicleIcon, typeFromRouteType, fmtMB } from '/chandb.js';
 
 const $ = (id) => document.getElementById(id);
 const statusEl = $('status'), boardEl = $('board'), filterEl = $('filter');
@@ -90,7 +90,7 @@ const say = (msg, isErr = false) => {
   statusEl.classList.toggle('err', isErr);
 };
 
-let conn, rows = [], human = true;
+let conn, rows = [], human = true, bootNote = '';
 let agencies = [], agencyFilter = null;   // null = show every agency
 
 function renderAgencyFilter() {
@@ -206,7 +206,7 @@ function render() {
                            : agencies.map(a => a.toUpperCase()).join(' + ');
   say(total > MAX_STATIONS
     ? `${who} · showing ${MAX_STATIONS} of ${total} stations — type in the filter to narrow`
-    : `${who} · ${total} station(s) — queried in your browser`);
+    : `${who} · ${total} station(s) — queried in your browser${bootNote}`);
 }
 
 async function load() {
@@ -231,9 +231,15 @@ async function load() {
 
 let available;
 try {
-  const ctx = await boot();
+  const ctx = await boot((loaded, total) => {
+      say(loaded < 0
+        ? 'engine ready — registering datasets…'
+        : `downloading DuckDB engine… ${fmtMB(loaded)} / ${fmtMB(total)} MB (one-time, then cached)`);
+    });
   conn = ctx.conn;
   available = ctx.available;
+  bootNote = ` · engine ${(ctx.timings.engineMs / 1000).toFixed(1)}s,`
+           + ` data ${(ctx.timings.datasetsMs / 1000).toFixed(1)}s`;
   await load();
 } catch (e) {
   say('failed to start: ' + e, true);

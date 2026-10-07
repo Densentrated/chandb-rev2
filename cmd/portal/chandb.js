@@ -9,7 +9,18 @@
 
 import * as duckdb from 'https://cdn.jsdelivr.net/npm/@duckdb/duckdb-wasm@1.32.0/+esm';
 
-export async function boot() {
+// boot(onProgress) brings the engine up.
+//
+// The DuckDB-WASM bundle is ~34MB. That is a one-time, browser-cached cost,
+// but it is long enough on a slow link that a silent page looks hung — so
+// instantiate reports download progress and every caller surfaces it.
+export async function boot(onProgress) {
+  // Phase timings, so a slow start says WHICH part was slow. The engine
+  // bundle is ~34MB and dominates a cold load; dataset registration is a
+  // handful of HTTP range requests. Without this split, every slow boot looks
+  // identical and is diagnosed by guesswork.
+  const t = { start: performance.now() };
+
   const bundles = duckdb.getJsDelivrBundles();
   const bundle = await duckdb.selectBundle(bundles);
 
@@ -19,10 +30,18 @@ export async function boot() {
     [`importScripts("${bundle.mainWorker}");`], { type: 'text/javascript' }));
 
   const db = new duckdb.AsyncDuckDB(new duckdb.ConsoleLogger(), new Worker(workerURL));
-  await db.instantiate(bundle.mainModule, bundle.pthreadWorker);
+  await db.instantiate(bundle.mainModule, bundle.pthreadWorker, (p) => {
+    // Absent when the bundle comes from cache, so guard rather than assume.
+    if (onProgress && p && p.bytesTotal) {
+      onProgress(p.bytesLoaded, p.bytesTotal);
+    }
+  });
   URL.revokeObjectURL(workerURL);
 
+  t.engine = performance.now();
+
   const conn = await db.connect();
+  if (onProgress) onProgress(-1, -1);   // engine up; registering datasets now
   const sets = await (await fetch('/api/datasets')).json();
 
   const available = new Set();
@@ -48,7 +67,14 @@ export async function boot() {
     files += ds.files.length;
   }
 
-  return { db, conn, available, bytes, files };
+  t.datasets = performance.now();
+  const timings = {
+    engineMs:   Math.round(t.engine - t.start),
+    datasetsMs: Math.round(t.datasets - t.engine),
+  };
+  console.info('chandb boot', timings);
+
+  return { db, conn, available, bytes, files, timings };
 }
 
 // columnsOf returns the column names of a view as a Set.
@@ -117,6 +143,8 @@ export function typeFromRouteType(n) {
 }
 
 // GTFS route_type, decoded for display.
+export function fmtMB(n) { return (n / 1048576).toFixed(1); }
+
 export function vehicleIcon(type) {
   switch (type) {
     case 'Subway': return '\u{1F687}';
