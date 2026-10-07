@@ -143,6 +143,26 @@ export function typeFromRouteType(n) {
 }
 
 // GTFS route_type, decoded for display.
+// DuckDB-WASM returns every BIGINT column as a JS BigInt. BigInt does not mix
+// with Number in arithmetic, and — the subtle one — Array.sort coerces its
+// comparator's return value to a Number, so a comparator that subtracts two
+// BigInts throws "Cannot convert a BigInt value to a number".
+//
+// Epoch seconds and durations are far inside Number's safe integer range, so
+// normalise on the way out of a query rather than defending at each use site.
+export function num(v) {
+  return typeof v === 'bigint' ? Number(v) : v;
+}
+
+// rowsOf converts an Arrow result to plain objects with BigInts flattened.
+export function rowsOf(res) {
+  return res.toArray().map(r => {
+    const o = r.toJSON();
+    for (const k of Object.keys(o)) o[k] = num(o[k]);
+    return o;
+  });
+}
+
 export function fmtMB(n) { return (n / 1048576).toFixed(1); }
 
 export function vehicleIcon(type) {

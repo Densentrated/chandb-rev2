@@ -81,7 +81,7 @@
 </main>
 
 <script type="module">
-import { boot, columnsOf, fmtEta, vehicleIcon, typeFromRouteType, fmtMB } from '/chandb.js';
+import { boot, columnsOf, fmtEta, vehicleIcon, typeFromRouteType, fmtMB, rowsOf } from '/chandb.js';
 
 const $ = (id) => document.getElementById(id);
 const statusEl = $('status'), boardEl = $('board'), filterEl = $('filter');
@@ -253,8 +253,7 @@ async function load() {
   const res = await conn.query(
     parts.join('\nUNION ALL\n') + '\nORDER BY agency, stop_name, arrival_time');
 
-  rows = res.toArray().map(r => {
-    const o = r.toJSON();
+  rows = rowsOf(res).map(o => {
     // vehicle_type postdates some gold partitions; derive it from the raw
     // GTFS route_type when it is absent so filtering works either way.
     o.kind = o.vehicle_type ?? typeFromRouteType(o.route_type) ?? 'Other';

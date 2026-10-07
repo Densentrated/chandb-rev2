@@ -208,7 +208,7 @@ var goldTables = []goldTable{
 }
 
 func transformGold(ctx context.Context, lake string) {
-	db, err := openDuckDB()
+	db, err := openDuckDB(lake)
 	if err != nil {
 		slog.Warn("gold skipped, duckdb unavailable", "err", err)
 		return
@@ -329,20 +329,33 @@ func loadStatic(ctx context.Context, db *sql.DB, staticDir string) error {
 	return nil
 }
 
-func openDuckDB() (*sql.DB, error) {
+func openDuckDB(lake string) (*sql.DB, error) {
 	db, err := sql.Open("duckdb", "")
 	if err != nil {
 		return nil, err
+	}
+
+	// Spill to DISK, not to /tmp.
+	//
+	// /tmp in this container is a tmpfs, so DuckDB offloading there consumes
+	// the very memory it is trying to free — and a full day of MBTA trip
+	// updates exhausted both the memory limit and the 48MB tmpfs cap. The lake
+	// volume is real disk with hundreds of GB spare. The leading dot keeps the
+	// directory out of the dt= partition scans in bronze and prune.
+	tmpDir := filepath.Join(lake, ".duckdb-tmp")
+	if err := os.MkdirAll(tmpDir, 0o755); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("duckdb temp dir: %w", err)
 	}
 	// The pipeline container is capped at 512MB and its /tmp tmpfs at 64MB,
 	// so DuckDB must be told to stay well inside both rather than discovering
 	// the limit via the OOM killer.
 	for _, pragma := range []string{
-		"SET memory_limit='256MB'",
+		"SET memory_limit='512MB'",
 		"SET threads=2",
 		"SET preserve_insertion_order=false",
-		"SET temp_directory='/tmp'",
-		"SET max_temp_directory_size='48MB'",
+		"SET temp_directory='" + tmpDir + "'",
+		"SET max_temp_directory_size='8GB'",
 	} {
 		if _, err := db.Exec(pragma); err != nil {
 			_ = db.Close()

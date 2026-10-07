@@ -62,7 +62,10 @@ services:
     cap_drop: [ALL]
     security_opt: ["no-new-privileges:true"]
     pids_limit: 128
-    mem_limit: 512m
+    # 1g, not 512m: the gold transform runs window functions over a full day of
+    # trip updates. DuckDB is capped at 512MB inside this, leaving headroom so
+    # the OOM killer is never the thing that enforces the limit.
+    mem_limit: 1g
     environment:
       INGEST_INTERVAL: 30m
     tmpfs:
