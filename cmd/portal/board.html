@@ -74,6 +74,7 @@
     <button id="tmode" type="button">Times: human-readable</button>
     <button id="reload" type="button">Refresh</button>
     <span id="agencies" class="agencies"></span>
+    <span id="types" class="agencies"></span>
   </div>
 
   <div class="board" id="board"></div>
@@ -92,6 +93,25 @@ const say = (msg, isErr = false) => {
 
 let conn, rows = [], human = true, bootNote = '';
 let agencies = [], agencyFilter = null;   // null = show every agency
+let types = [], typeFilter = null;        // null = show every vehicle type
+
+// Rail first: a rider looking for the Orange Line should not have to scroll
+// past four hundred bus stops to find it.
+const TYPE_ORDER = ['Subway', 'Light Rail', 'Commuter Rail', 'Ferry', 'Bus'];
+
+function renderTypeFilter() {
+  const box = $('types');
+  box.replaceChildren();
+  if (types.length < 2) return;
+
+  for (const ty of [null, ...types]) {
+    const b = document.createElement('button');
+    b.textContent = ty === null ? 'All modes' : ty;
+    b.className = typeFilter === ty ? 'on' : '';
+    b.onclick = () => { typeFilter = ty; renderTypeFilter(); render(); };
+    box.appendChild(b);
+  }
+}
 
 function renderAgencyFilter() {
   const box = $('agencies');
@@ -141,6 +161,7 @@ function render() {
 
   for (const r of rows) {
     if (agencyFilter && r.agency !== agencyFilter) continue;
+    if (typeFilter && r.kind !== typeFilter) continue;
     if (q && !r.stop_name.toLowerCase().includes(q)) continue;
     // Keyed by agency too: "Civic Center" exists in more than one transit
     // system, and merging them into one card would be a lie.
@@ -150,7 +171,15 @@ function render() {
     if (list.length < 6) list.push(r); // a board shows the next few, not all
   }
 
-  const total = byStop.size;
+  // A departure board is ordered by what leaves soonest. Sorting by name put
+  // every numerically-named bus stop first and pushed Downtown Crossing to
+  // position 1893 — past the render cap, so no rail ever appeared.
+  const ordered = [...byStop.values()].sort((a, b) => {
+    const rank = (l) => TYPE_ORDER.indexOf(l[0].kind);
+    return (rank(a) - rank(b)) || (a[0].seconds_away - b[0].seconds_away);
+  });
+
+  const total = ordered.length;
   boardEl.replaceChildren();
   if (!total) {
     say(q ? `No stations matching "${filterEl.value}".`
@@ -159,7 +188,7 @@ function render() {
   }
 
   let drawn = 0;
-  for (const [, deps] of byStop) {
+  for (const deps of ordered) {
     if (drawn++ >= MAX_STATIONS) break;
     const card = document.createElement('section');
     card.className = 'station';
@@ -179,7 +208,7 @@ function render() {
       const ico = document.createElement('span');
       // vehicle_type was added to gold later than this page; fall back to the
       // raw GTFS route_type so older partitions still show the right icon.
-      ico.textContent = vehicleIcon(d.vehicle_type ?? typeFromRouteType(d.route_type));
+      ico.textContent = vehicleIcon(d.kind);
 
       const mid = document.createElement('span');
       const rt = document.createElement('span');
@@ -202,8 +231,9 @@ function render() {
     boardEl.appendChild(card);
   }
 
-  const who = agencyFilter ? agencyFilter.toUpperCase()
-                           : agencies.map(a => a.toUpperCase()).join(' + ');
+  const who = (agencyFilter ? agencyFilter.toUpperCase()
+                            : agencies.map(a => a.toUpperCase()).join(' + '))
+            + (typeFilter ? ` · ${typeFilter}` : '');
   say(total > MAX_STATIONS
     ? `${who} · showing ${MAX_STATIONS} of ${total} stations — type in the filter to narrow`
     : `${who} · ${total} station(s) — queried in your browser${bootNote}`);
@@ -223,9 +253,18 @@ async function load() {
   const res = await conn.query(
     parts.join('\nUNION ALL\n') + '\nORDER BY agency, stop_name, arrival_time');
 
-  rows = res.toArray().map(r => r.toJSON());
+  rows = res.toArray().map(r => {
+    const o = r.toJSON();
+    // vehicle_type postdates some gold partitions; derive it from the raw
+    // GTFS route_type when it is absent so filtering works either way.
+    o.kind = o.vehicle_type ?? typeFromRouteType(o.route_type) ?? 'Other';
+    return o;
+  });
   agencies = [...new Set(rows.map(r => r.agency))].sort();
+  types = [...new Set(rows.map(r => r.kind))]
+    .sort((a, b) => TYPE_ORDER.indexOf(a) - TYPE_ORDER.indexOf(b));
   renderAgencyFilter();
+  renderTypeFilter();
   render();
 }
 
