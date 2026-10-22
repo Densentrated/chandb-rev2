@@ -401,11 +401,12 @@ func ingestAll(ctx context.Context, lake string) []string {
 	for range workers {
 		go worker()
 	}
+send:
 	for _, f := range feeds {
 		select {
 		case jobs <- f:
 		case <-ctx.Done():
-			break
+			break send
 		}
 	}
 	close(jobs)
