@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestHealthURLRewritesWildcardBinds(t *testing.T) {
@@ -39,7 +40,74 @@ func TestHealthzReturns200(t *testing.T) {
 	}
 }
 
+// A page must never be cached independently of the module it imports: that
+// skew is what produces a silent SyntaxError and a page stuck on its first
+// status line.
+func TestPagesAreNeverCachedStale(t *testing.T) {
+	buildAssets()
+	for name, h := range map[string]http.HandlerFunc{
+		"index": handleIndex,
+		"board": servePage(boardPage, "text/html; charset=utf-8"),
+	} {
+		rec := httptest.NewRecorder()
+		h(rec, httptest.NewRequest(http.MethodGet, "/", nil))
+		if cc := rec.Header().Get("Cache-Control"); cc != "no-cache" {
+			t.Errorf("%s Cache-Control = %q, want no-cache", name, cc)
+		}
+	}
+}
+
+func TestPagesReferenceTheHashedModule(t *testing.T) {
+	buildAssets()
+	if !strings.HasPrefix(hashedJSPath, "/chandb.") ||
+		!strings.HasSuffix(hashedJSPath, ".js") || len(hashedJSPath) < 20 {
+		t.Fatalf("hashed path looks wrong: %q", hashedJSPath)
+	}
+	for name, body := range map[string][]byte{"index": indexPage, "board": boardPage} {
+		if !strings.Contains(string(body), hashedJSPath) {
+			t.Errorf("%s does not import the hashed module %s", name, hashedJSPath)
+		}
+		if strings.Contains(string(body), "'/chandb.js'") {
+			t.Errorf("%s still imports the unhashed module", name)
+		}
+	}
+}
+
+// Changing the module must change its URL, or caches keep the old bytes.
+func TestHashedPathTracksContent(t *testing.T) {
+	buildAssets()
+	first := hashedJSPath
+
+	orig := chandbJS
+	chandbJS = append(append([]byte{}, orig...), []byte("\n// changed\n")...)
+	buildAssets()
+	changed := hashedJSPath
+
+	chandbJS = orig
+	buildAssets()
+
+	if first == changed {
+		t.Error("different module content produced the same URL")
+	}
+	if hashedJSPath != first {
+		t.Error("restoring the content did not restore the URL")
+	}
+}
+
+func TestHashedModuleIsImmutable(t *testing.T) {
+	buildAssets()
+	rec := httptest.NewRecorder()
+	serveImmutable(chandbJS, "text/javascript; charset=utf-8")(
+		rec, httptest.NewRequest(http.MethodGet, hashedJSPath, nil))
+
+	cc := rec.Header().Get("Cache-Control")
+	if !strings.Contains(cc, "immutable") {
+		t.Errorf("Cache-Control = %q, want immutable", cc)
+	}
+}
+
 func TestIndexServesHTML(t *testing.T) {
+	buildAssets()
 	rec := httptest.NewRecorder()
 	handleIndex(rec, httptest.NewRequest(http.MethodGet, "/", nil))
 
@@ -50,22 +118,23 @@ func TestIndexServesHTML(t *testing.T) {
 		t.Errorf("content-type = %q, want text/html", ct)
 	}
 	// The engine setup lives in the shared module now, not inline.
-	if !strings.Contains(rec.Body.String(), "/chandb.js") {
-		t.Error("page should import the shared runtime")
+	if !strings.Contains(rec.Body.String(), hashedJSPath) {
+		t.Error("page should import the hashed shared runtime")
 	}
 }
 
 func TestBoardPageIsServed(t *testing.T) {
+	buildAssets()
 	rec := httptest.NewRecorder()
-	servePage(boardHTML, "text/html; charset=utf-8")(
+	servePage(boardPage, "text/html; charset=utf-8")(
 		rec, httptest.NewRequest(http.MethodGet, "/board", nil))
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", rec.Code)
 	}
 	body := rec.Body.String()
-	if !strings.Contains(body, "/chandb.js") {
-		t.Error("board should import the shared runtime")
+	if !strings.Contains(body, hashedJSPath) {
+		t.Error("board should import the hashed shared runtime")
 	}
 	if !strings.Contains(body, "stop_events") {
 		t.Error("board should query a stop_events table")
@@ -164,12 +233,50 @@ func TestDatasetsEmptyGoldReturnsEmptyList(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", rec.Code)
 	}
+
 	var sets []dataset
 	if err := json.Unmarshal(rec.Body.Bytes(), &sets); err != nil {
 		t.Fatalf("body is not valid JSON: %v", err)
 	}
 	if len(sets) != 0 {
 		t.Errorf("got %d datasets, want 0", len(sets))
+	}
+}
+
+func TestCatalogCachesAndSupportsETag(t *testing.T) {
+	gold := t.TempDir()
+	writeGold(t, gold, "mbta/vehicle_positions/dt=2026-10-07/part-0.parquet", "one")
+	cache := newCatalog(gold)
+	cache.refreshAfter = time.Hour
+
+	first := httptest.NewRecorder()
+	cache.serveHTTP(first, httptest.NewRequest(http.MethodGet, "/api/datasets", nil))
+	etag := first.Header().Get("ETag")
+	if etag == "" {
+		t.Fatal("catalog did not publish an ETag")
+	}
+	writeGold(t, gold, "bart/trip_updates/dt=2026-10-07/part-0.parquet", "two")
+
+	cached := httptest.NewRecorder()
+	cache.serveHTTP(cached, httptest.NewRequest(http.MethodGet, "/api/datasets", nil))
+	if strings.Contains(cached.Body.String(), "bart_trip_updates") {
+		t.Fatal("catalog rescanned before its refresh interval")
+	}
+
+	notModified := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/datasets", nil)
+	req.Header.Set("If-None-Match", etag)
+	cache.serveHTTP(notModified, req)
+	if notModified.Code != http.StatusNotModified {
+		t.Fatalf("status = %d, want 304", notModified.Code)
+	}
+
+	cache.refreshAfter = -time.Second
+	cache.expires = time.Time{}
+	refreshed := httptest.NewRecorder()
+	cache.serveHTTP(refreshed, httptest.NewRequest(http.MethodGet, "/api/datasets", nil))
+	if !strings.Contains(refreshed.Body.String(), "bart_trip_updates") {
+		t.Fatal("expired catalog did not refresh")
 	}
 }
 

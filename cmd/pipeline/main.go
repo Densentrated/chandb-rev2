@@ -32,7 +32,9 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -107,6 +109,34 @@ var feeds = []feed{
 		secret: "511_api_key",
 	},
 
+	// SEPTA runs two independent GTFS feeds with separate id spaces: one for
+	// bus, metro and trolley, one for Regional Rail. They are modelled as two
+	// agencies so each realtime feed joins only against its own static tables.
+	// No API key.
+	{
+		agency: "septa",
+		name:   "vehicle_positions",
+		url:    "https://www3.septa.org/gtfsrt/septa-pa-us/Vehicle/rtVehiclePosition.pb",
+	},
+	{
+		agency: "septa",
+		name:   "trip_updates",
+		url:    "https://www3.septa.org/gtfsrt/septa-pa-us/Trip/rtTripUpdates.pb",
+	},
+	{
+		agency: "septarail",
+		name:   "vehicle_positions",
+		url:    "https://www3.septa.org/gtfsrt/septarail-pa-us/Vehicle/rtVehiclePosition.pb",
+	},
+	// Regional Rail trip updates carry one stop_time_update per trip with
+	// only a stop_sequence and a delay — no stop_id and no absolute time — so
+	// they cannot reach the departure board without joining stop_times.txt.
+	{
+		agency: "septarail",
+		name:   "trip_updates",
+		url:    "https://www3.septa.org/gtfsrt/septarail-pa-us/Trip/rtTripUpdates.pb",
+	},
+
 	// Static GTFS: the lookup tables that turn realtime IDs into meaning.
 	// Without this, a vehicle is "route_id 714 near stop_id 71420"; with it,
 	// that's the Pemberton Point bus near a named stop with coordinates.
@@ -124,9 +154,31 @@ var feeds = []feed{
 		ext:    "zip",
 		daily:  true,
 	},
+	// SEPTA publishes both feeds in ONE zip that wraps google_bus.zip and
+	// google_rail.zip (see nestedStatic). It is fetched once per agency so
+	// each raw snapshot stays self-contained under its own agency; that costs
+	// an extra ~22MB a day, which raw retention bounds.
+	{
+		agency: "septa",
+		name:   "gtfs_static",
+		url:    "https://www3.septa.org/developer/gtfs_public.zip",
+		ext:    "zip",
+		daily:  true,
+	},
+	{
+		agency: "septarail",
+		name:   "gtfs_static",
+		url:    "https://www3.septa.org/developer/gtfs_public.zip",
+		ext:    "zip",
+		daily:  true,
+	},
 }
 
 const defaultInterval = 30 * time.Minute
+
+// Feeds are independent network requests; a small fixed pool reduces cycle
+// wall time without creating one goroutine per configured endpoint.
+const ingestWorkers = 4
 
 func main() {
 	once := flag.Bool("once", false,
@@ -304,39 +356,69 @@ func ingestAll(ctx context.Context, lake string) []string {
 	client := &http.Client{Timeout: fetchTimeout}
 	now := time.Now().UTC()
 
+	workers := min(ingestWorkers, len(feeds))
+	jobs := make(chan feed)
+	var wg sync.WaitGroup
+	var mu sync.Mutex
 	var failed []string
-	for _, f := range feeds {
-		if ctx.Err() != nil {
-			return failed
-		}
-		if f.daily && alreadyHaveToday(lake, f, now) {
-			continue
-		}
-		url := f.url
-		if f.secret != "" {
-			key, err := readSecret(f.secret)
-			if err != nil {
-				slog.Warn("skipping feed, secret unavailable",
-					"agency", f.agency, "feed", f.name,
-					"secret", f.secret, "err", err)
+
+	worker := func() {
+		defer wg.Done()
+		for f := range jobs {
+			if ctx.Err() != nil {
+				return
+			}
+			if f.daily && alreadyHaveToday(lake, f, now) {
 				continue
 			}
-			url = strings.ReplaceAll(url, "{key}", key)
-		}
+			url := f.url
+			if f.secret != "" {
+				key, err := readSecret(f.secret)
+				if err != nil {
+					slog.Warn("skipping feed, secret unavailable",
+						"agency", f.agency, "feed", f.name,
+						"secret", f.secret, "err", err)
+					continue
+				}
+				url = strings.ReplaceAll(url, "{key}", key)
+			}
 
-		path, n, err := fetchFeed(ctx, client, url, lake, f, now)
-		if err != nil {
-			// One bad feed must not discard the others. Record it and keep
-			// going; the exit code at the end surfaces it.
-			slog.Error("feed failed",
-				"agency", f.agency, "feed", f.name, "err", err)
-			failed = append(failed, f.agency+"/"+f.name)
-			continue
+			path, n, err := fetchFeed(ctx, client, url, lake, f, now)
+			if err != nil {
+				slog.Error("feed failed",
+					"agency", f.agency, "feed", f.name, "err", err)
+				mu.Lock()
+				failed = append(failed, f.agency+"/"+f.name)
+				mu.Unlock()
+				continue
+			}
+			slog.Info("ingested",
+				"agency", f.agency, "feed", f.name, "bytes", n, "path", path)
 		}
-		slog.Info("ingested",
-			"agency", f.agency, "feed", f.name, "bytes", n, "path", path)
 	}
+
+	wg.Add(workers)
+	for range workers {
+		go worker()
+	}
+	for _, f := range feeds {
+		select {
+		case jobs <- f:
+		case <-ctx.Done():
+			break
+		}
+	}
+	close(jobs)
+	wg.Wait()
+	sort.Strings(failed)
 	return failed
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 // snapshotPath is the destination for one fetch. Exported shape:

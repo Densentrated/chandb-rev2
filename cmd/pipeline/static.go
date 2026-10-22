@@ -9,6 +9,7 @@ package main
 
 import (
 	"archive/zip"
+	"bytes"
 	"fmt"
 	"io"
 	"os"
@@ -18,6 +19,15 @@ import (
 
 // staticTables are the GTFS files extracted to bronze.
 var staticTables = []string{"routes.txt", "stops.txt", "trips.txt"}
+
+// nestedStatic names, per agency, a zip INSIDE the raw zip that holds that
+// agency's GTFS. SEPTA's gtfs_public.zip contains no tables at its top level,
+// only google_bus.zip and google_rail.zip, which are complete, independent
+// feeds. Agencies not listed here keep their tables at the top level.
+var nestedStatic = map[string]string{
+	"septa":     "google_bus.zip",
+	"septarail": "google_rail.zip",
+}
 
 // maxStaticMemberBytes bounds decompression. A zip member can claim a modest
 // compressed size and expand without limit; without a cap, a hostile or
@@ -54,12 +64,20 @@ func extractStatic(lake, rawZip string) error {
 	}
 	defer func() { _ = zr.Close() }()
 
+	src := &zr.Reader
+	agency, _ := agencyAndFeed(lake, rawZip)
+	if inner, ok := nestedStatic[agency]; ok {
+		if src, err = openNested(src, inner); err != nil {
+			return fmt.Errorf("%s: %w", rawZip, err)
+		}
+	}
+
 	if err := os.MkdirAll(outDir, 0o755); err != nil {
 		return err
 	}
 
 	for _, want := range staticTables {
-		member := findMember(zr, want)
+		member := findMember(src, want)
 		if member == nil {
 			return fmt.Errorf("%s not present in %s", want, rawZip)
 		}
@@ -70,7 +88,32 @@ func extractStatic(lake, rawZip string) error {
 	return nil
 }
 
-func findMember(zr *zip.ReadCloser, name string) *zip.File {
+// openNested opens a zip stored as a member of another zip. archive/zip needs
+// random access, so the member is read into memory — under the same
+// decompression cap as any other member.
+func openNested(zr *zip.Reader, name string) (*zip.Reader, error) {
+	member := findMember(zr, name)
+	if member == nil {
+		return nil, fmt.Errorf("nested %s not present", name)
+	}
+	rc, err := member.Open()
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rc.Close() }()
+
+	b, err := io.ReadAll(io.LimitReader(rc, maxStaticMemberBytes))
+	if err != nil {
+		return nil, err
+	}
+	if len(b) == maxStaticMemberBytes {
+		return nil, fmt.Errorf("nested %s hit the %d byte decompression cap",
+			name, maxStaticMemberBytes)
+	}
+	return zip.NewReader(bytes.NewReader(b), int64(len(b)))
+}
+
+func findMember(zr *zip.Reader, name string) *zip.File {
 	for _, f := range zr.File {
 		// Compare the base name only: never trust a path from inside an
 		// archive, or a member called ../../etc/passwd writes outside the

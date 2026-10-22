@@ -209,6 +209,9 @@ func TestTransformIgnoresUnmodelledFeeds(t *testing.T) {
 }
 
 func TestTransformBronzeIsIdempotent(t *testing.T) {
+	// The fixture partition is a fixed date. Without this, it ages past the
+	// bronze retention window and the transform correctly skips it.
+	t.Setenv("BRONZE_RETENTION_DAYS", "36500")
 	lake := t.TempDir()
 	writeFeed(t, lake, "mbta", "vehicle_positions", &gtfs.FeedMessage{
 		Header: &gtfs.FeedHeader{Timestamp: proto.Uint64(1)},
@@ -250,6 +253,7 @@ func TestTransformRejectsGarbageProtobuf(t *testing.T) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatal(err)
 	}
+
 	raw := filepath.Join(dir, "20261007T050000Z.pb")
 	// Bytes that are not a valid FeedMessage at all.
 	if err := os.WriteFile(raw, []byte{0xff, 0xff, 0xff, 0xff, 0xff}, 0o644); err != nil {
@@ -271,5 +275,24 @@ func readFile(t *testing.T, p string) string {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	return string(b)
+}
+
+func TestDecodeSnapshotDoesNotPublish(t *testing.T) {
+	msg := &gtfs.FeedMessage{Header: &gtfs.FeedHeader{
+		GtfsRealtimeVersion: proto.String("2.0"),
+		Timestamp:           proto.Uint64(1),
+	}}
+	data, err := proto.Marshal(msg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	n, write, err := decodeSnapshot(data, "mbta", "alerts")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 || write != nil {
+		t.Fatalf("unmodelled decode = (%d, %v), want no publication", n, write != nil)
+	}
 }

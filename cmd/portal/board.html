@@ -6,35 +6,41 @@
 <title>chandb — departure board</title>
 <style>
   :root {
-    --bg: #0f1115; --panel: #171a21; --line: #272b35;
-    --fg: #e6e8ee; --muted: #8b93a7; --accent: #6ea8fe;
+    --bg: #0b1020; --panel: #121a2b; --panel-2: #18243a; --line: #283653;
+    --fg: #edf3ff; --muted: #9caac3; --accent: #79b8ff; --focus: #b9d8ff;
     --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   }
   * { box-sizing: border-box; }
   body { margin: 0; background: var(--bg); color: var(--fg);
          font: 15px/1.5 system-ui, -apple-system, sans-serif; }
-  header { padding: 20px 24px 12px; border-bottom: 1px solid var(--line); }
-  h1 { margin: 0 0 4px; font-size: 18px; font-weight: 600; }
+  header { padding: 20px max(20px, calc((100vw - 1360px) / 2)) 18px; border-bottom: 1px solid var(--line); background: #0d1527; }
+  .head { max-width: 1360px; margin: auto; display: flex; justify-content: space-between; gap: 24px; align-items: flex-start; }
+  h1 { margin: 0 0 5px; font-size: clamp(20px, 2.5vw, 28px); letter-spacing: -.02em; font-weight: 700; }
   .sub { color: var(--muted); font-size: 13px; }
   .sub a { color: var(--accent); }
-  main { padding: 18px 24px 48px; max-width: 1400px; }
+  nav { display: flex; gap: 7px; flex: none; } nav a { color: var(--muted); border: 1px solid var(--line); border-radius: 7px; padding: 7px 11px; font-size: 12px; text-decoration: none; }
+  nav a[aria-current="page"], nav a:hover { color: var(--fg); border-color: var(--accent); background: var(--panel-2); }
+  main { padding: 24px max(20px, calc((100vw - 1360px) / 2)) 56px; max-width: 1400px; margin: auto; }
+  .intro { margin-bottom: 18px; } .eyebrow { color: var(--accent); text-transform: uppercase; letter-spacing: .12em; font: 700 11px var(--mono); }
+  .intro h2 { margin: 4px 0 3px; font-size: 20px; } .intro p { margin: 0; color: var(--muted); font-size: 13px; }
   .controls { display: flex; gap: 10px; align-items: center;
               margin-bottom: 16px; flex-wrap: wrap; }
   input[type=search] {
     flex: 1 1 260px; max-width: 420px; padding: 8px 12px;
-    background: var(--panel); color: var(--fg);
+    background: #0d1527; color: var(--fg);
     border: 1px solid var(--line); border-radius: 6px; font-size: 13px;
   }
-  input[type=search]:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+  input[type=search]:focus { outline: 3px solid var(--focus); outline-offset: 2px; }
   button {
     padding: 8px 14px; border-radius: 6px; cursor: pointer; font-size: 13px;
     background: var(--panel); color: var(--muted); border: 1px solid var(--line);
   }
   button:hover { color: var(--fg); border-color: var(--accent); }
+  button:focus-visible, a:focus-visible { outline: 3px solid var(--focus); outline-offset: 2px; }
   #status { margin-bottom: 14px; padding: 8px 12px; border-radius: 6px;
             background: var(--panel); border: 1px solid var(--line);
             font: 12px/1.4 var(--mono); color: var(--muted); }
-  #status.err { color: #ff8e8e; border-color: #5a2b2b; }
+  #status.err { color: #ff9b9b; border-color: #713f4b; background: #281a2a; }
   .board { display: grid; gap: 12px;
            grid-template-columns: repeat(auto-fill, minmax(340px, 1fr)); }
   .station { background: var(--panel); border: 1px solid var(--line);
@@ -55,40 +61,45 @@
         overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .eta { font: 600 13px/1 var(--mono); color: var(--accent); white-space: nowrap; }
   .eta.past { color: var(--muted); font-weight: 400; }
+  .empty { padding: 40px 18px; border: 1px dashed var(--line); border-radius: 8px; color: var(--muted); text-align: center; }
+  .counts { color: var(--muted); font: 12px var(--mono); margin: -5px 0 13px; }
+  @media (max-width: 700px) { .head { display: block; } nav { margin-top: 14px; } main { padding-top: 18px; } .controls { align-items: stretch; } input[type=search] { max-width: none; flex-basis: 100%; } .controls button { flex: 1; } .board { grid-template-columns: 1fr; } }
 </style>
 </head>
 <body>
-<header>
-  <h1>chandb — departure board</h1>
+<header><div class="head"><div><h1>chandb</h1>
   <div class="sub">
     Next arrivals per station across every agency in the lake.
-    <a href="/">SQL viewer →</a>
-  </div>
-</header>
+  </div></div><nav aria-label="Primary"><a href="/">SQL explorer</a><a href="/board" aria-current="page">Departure board</a></nav></div></header>
 
 <main>
-  <div id="status">booting DuckDB-WASM…</div>
+  <section class="intro"><div class="eyebrow">Live-ish snapshot</div><h2>Find the next departure</h2><p>Browse the latest published arrivals. Times are relative to each agency's newest snapshot.</p></section>
+  <div id="status" role="status" aria-live="polite" aria-busy="true">Starting the in-browser query engine…</div>
 
   <div class="controls">
-    <input type="search" id="filter" placeholder="Filter stations… e.g. Government, Embarcadero">
+    <input type="search" id="filter" aria-label="Filter stations" placeholder="Filter stations… e.g. Government, Embarcadero, City Hall">
     <button id="tmode" type="button">Times: human-readable</button>
     <button id="reload" type="button">Refresh</button>
+    <button id="clear" type="button" hidden>Clear filters</button>
     <span id="agencies" class="agencies"></span>
     <span id="types" class="agencies"></span>
   </div>
+  <div id="counts" class="counts" aria-live="polite"></div>
 
-  <div class="board" id="board"></div>
+  <div class="board" id="board"><div class="empty">Loading arrivals…</div></div>
 </main>
 
 <script type="module">
 import { boot, columnsOf, fmtEta, vehicleIcon, typeFromRouteType, fmtMB, rowsOf } from '/chandb.js';
 
 const $ = (id) => document.getElementById(id);
-const statusEl = $('status'), boardEl = $('board'), filterEl = $('filter');
+const statusEl = $('status'), boardEl = $('board'), filterEl = $('filter'),
+      countsEl = $('counts'), clearEl = $('clear');
 
 const say = (msg, isErr = false) => {
   statusEl.textContent = msg;
   statusEl.classList.toggle('err', isErr);
+  statusEl.setAttribute('aria-busy', !isErr && !msg.includes('station') && !msg.includes('showing') ? 'true' : 'false');
 };
 
 let conn, rows = [], human = true, bootNote = '';
@@ -97,7 +108,14 @@ let types = [], typeFilter = null;        // null = show every vehicle type
 
 // Rail first: a rider looking for the Orange Line should not have to scroll
 // past four hundred bus stops to find it.
-const TYPE_ORDER = ['Subway', 'Light Rail', 'Commuter Rail', 'Ferry', 'Bus'];
+const TYPE_ORDER = ['Subway', 'Light Rail', 'Commuter Rail', 'Ferry', 'Trolleybus', 'Bus'];
+
+// Anything not listed sorts last. indexOf's -1 would otherwise rank an
+// unknown mode AHEAD of the subway.
+const typeRank = (ty) => {
+  const i = TYPE_ORDER.indexOf(ty);
+  return i < 0 ? TYPE_ORDER.length : i;
+};
 
 function renderTypeFilter() {
   const box = $('types');
@@ -175,12 +193,14 @@ function render() {
   // every numerically-named bus stop first and pushed Downtown Crossing to
   // position 1893 — past the render cap, so no rail ever appeared.
   const ordered = [...byStop.values()].sort((a, b) => {
-    const rank = (l) => TYPE_ORDER.indexOf(l[0].kind);
+    const rank = (l) => typeRank(l[0].kind);
     return (rank(a) - rank(b)) || (a[0].seconds_away - b[0].seconds_away);
   });
 
   const total = ordered.length;
   boardEl.replaceChildren();
+  clearEl.hidden = !(q || agencyFilter || typeFilter);
+  countsEl.textContent = total ? `${Math.min(total, MAX_STATIONS)} of ${total} stations shown` : '';
   if (!total) {
     say(q ? `No stations matching "${filterEl.value}".`
           : 'No upcoming arrivals in the latest snapshot.');
@@ -240,9 +260,12 @@ function render() {
 }
 
 async function load() {
+  $('reload').disabled = true;
+  boardEl.innerHTML = '<div class="empty">Loading arrivals…</div>';
   const tables = [...available].filter(t => t.endsWith('_stop_events')).sort();
   if (!tables.length) {
     say('No stop_events table published yet. The pipeline writes it on its next cycle.', true);
+    $('reload').disabled = false;
     return;
   }
 
@@ -261,10 +284,11 @@ async function load() {
   });
   agencies = [...new Set(rows.map(r => r.agency))].sort();
   types = [...new Set(rows.map(r => r.kind))]
-    .sort((a, b) => TYPE_ORDER.indexOf(a) - TYPE_ORDER.indexOf(b));
+    .sort((a, b) => typeRank(a) - typeRank(b));
   renderAgencyFilter();
   renderTypeFilter();
   render();
+  $('reload').disabled = false;
 }
 
 let available;
@@ -285,7 +309,19 @@ try {
 }
 
 filterEl.addEventListener('input', render);
-$('reload').onclick = () => load().catch(e => say(String(e), true));
+clearEl.onclick = () => {
+  filterEl.value = '';
+  agencyFilter = null;
+  typeFilter = null;
+  renderAgencyFilter();
+  renderTypeFilter();
+  render();
+  filterEl.focus();
+};
+$('reload').onclick = () => load().catch(e => {
+  say('Could not refresh arrivals: ' + e, true);
+  $('reload').disabled = false;
+});
 $('tmode').onclick = (e) => {
   human = !human;
   e.target.textContent = human ? 'Times: human-readable' : 'Times: epoch seconds';

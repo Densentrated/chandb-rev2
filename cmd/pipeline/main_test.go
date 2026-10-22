@@ -185,6 +185,7 @@ func TestFeedTableIsWellFormed(t *testing.T) {
 		if seen[key] {
 			t.Errorf("duplicate feed %s", key)
 		}
+
 		seen[key] = true
 
 		if !strings.HasPrefix(f.url, "https://") {
@@ -197,5 +198,28 @@ func TestFeedTableIsWellFormed(t *testing.T) {
 			t.Errorf("%s: declares secret %q but url has no {key}",
 				key, f.secret)
 		}
+	}
+
+}
+
+func TestGoldPartitionChangedUsesBronzeWatermark(t *testing.T) {
+	lake := t.TempDir()
+	src := filepath.Join(lake, "bronze", "dt=2026-10-07")
+	if err := os.MkdirAll(src, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	out := filepath.Join(lake, "gold.parquet")
+	if err := os.WriteFile(out, []byte("gold"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if goldPartitionChanged(src, out) {
+		t.Fatal("unchanged source should not require a rebuild")
+	}
+	time.Sleep(2 * time.Millisecond)
+	if err := os.WriteFile(filepath.Join(src, "new.ndjson"), []byte("{}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if !goldPartitionChanged(src, out) {
+		t.Fatal("new bronze input should require a rebuild")
 	}
 }

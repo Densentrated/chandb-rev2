@@ -2,6 +2,7 @@ package main
 
 import (
 	"archive/zip"
+	"bytes"
 	"os"
 	"path/filepath"
 	"testing"
@@ -62,6 +63,73 @@ func TestExtractStaticPullsOnlyWantedTables(t *testing.T) {
 	// shapes.txt is 16MB in the real feed and nothing joins against it yet.
 	if _, err := os.Stat(filepath.Join(out, "shapes.txt")); err == nil {
 		t.Error("shapes.txt should not be extracted")
+	}
+}
+
+// zipBytes builds an in-memory zip, for nesting inside another one.
+func zipBytes(t *testing.T, members map[string]string) string {
+	t.Helper()
+	var buf bytes.Buffer
+	zw := zip.NewWriter(&buf)
+	for name, body := range members {
+		w, err := zw.Create(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := w.Write([]byte(body)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return buf.String()
+}
+
+// SEPTA's zip holds two feeds. Each agency must get its OWN inner feed: mixing
+// bus stops into the rail lookup would join on colliding ids.
+func TestExtractStaticPicksNestedFeedPerAgency(t *testing.T) {
+	lake := t.TempDir()
+	outer := map[string]string{
+		"google_bus.zip": zipBytes(t, map[string]string{
+			"routes.txt": "route_id\nL1\n",
+			"stops.txt":  "stop_id\n4\n",
+			"trips.txt":  "trip_id\nBUS\n",
+		}),
+		"google_rail.zip": zipBytes(t, map[string]string{
+			"routes.txt": "route_id\nAIR\n",
+			"stops.txt":  "stop_id\n90004\n",
+			"trips.txt":  "trip_id\nRAIL\n",
+		}),
+	}
+
+	for agency, want := range map[string]string{"septa": "BUS", "septarail": "RAIL"} {
+		raw := filepath.Join(lake, "raw", agency, "gtfs_static",
+			"dt=2026-10-07", "20261007T050000Z.zip")
+		makeZip(t, raw, outer)
+		if err := extractStatic(lake, raw); err != nil {
+			t.Fatalf("%s: %v", agency, err)
+		}
+		got, err := os.ReadFile(filepath.Join(lake, "bronze", agency,
+			"gtfs_static", "dt=2026-10-07", "trips.txt"))
+		if err != nil {
+			t.Fatalf("%s: %v", agency, err)
+		}
+		if string(got) != "trip_id\n"+want+"\n" {
+			t.Errorf("%s got trips %q, want the %s feed", agency, got, want)
+		}
+	}
+}
+
+func TestExtractStaticFailsWhenNestedFeedMissing(t *testing.T) {
+	lake := t.TempDir()
+	raw := filepath.Join(lake, "raw", "septa", "gtfs_static",
+		"dt=2026-10-07", "20261007T050000Z.zip")
+	// Tables at the top level, but not where SEPTA's layout says they live.
+	makeZip(t, raw, fullGTFS())
+
+	if err := extractStatic(lake, raw); err == nil {
+		t.Error("a SEPTA zip without google_bus.zip should fail loudly")
 	}
 }
 

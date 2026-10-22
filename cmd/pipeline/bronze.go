@@ -22,11 +22,14 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/MobilityData/gtfs-realtime-bindings/golang/gtfs"
 	"google.golang.org/protobuf/proto"
 )
+
+const bronzeWorkers = 4
 
 // vehicleRow is one vehicle at one instant: where a train actually is.
 // Pointers where absent must be distinguishable from zero — (0,0) is a real
@@ -85,6 +88,7 @@ func transformBronze(ctx context.Context, lake string) {
 	bronzeCutoff := time.Now().UTC().AddDate(0, 0,
 		-retentionDays("BRONZE_RETENTION_DAYS", defaultBronzeRetentionDays))
 
+	var files []string
 	err := filepath.WalkDir(rawRoot, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
@@ -112,29 +116,63 @@ func transformBronze(ctx context.Context, lake string) {
 			return nil
 		}
 
-		out, err := bronzePath(lake, path)
-		if err != nil {
-			return nil // not a path we recognise; leave it alone
-		}
-		if _, err := os.Stat(out); err == nil {
-			skipped++
-			return nil
-		}
-
-		n, err := transformFile(lake, path, out)
-		switch {
-		case err != nil:
-			slog.Warn("bronze transform failed", "file", path, "err", err)
-			failed++
-		default:
-			done++
-			_ = n
-		}
+		files = append(files, path)
 		return nil
 	})
 	if err != nil && ctx.Err() == nil {
 		slog.Warn("bronze walk ended early", "err", err)
 	}
+
+	// Decoding is CPU-bound and each snapshot is independent. A small fixed
+	// pool keeps a backfill from creating one goroutine per file while making
+	// catch-up substantially faster on multi-core hosts.
+	workers := min(bronzeWorkers, len(files))
+	jobs := make(chan string)
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	worker := func() {
+		defer wg.Done()
+		for path := range jobs {
+			if ctx.Err() != nil {
+				return
+			}
+			out, err := bronzePath(lake, path)
+			if err != nil {
+				continue
+			}
+			if _, err := os.Stat(out); err == nil {
+				mu.Lock()
+				skipped++
+				mu.Unlock()
+				continue
+			}
+			_, err = transformFile(lake, path, out)
+			mu.Lock()
+			if err != nil {
+				failed++
+			} else {
+				done++
+			}
+			mu.Unlock()
+			if err != nil {
+				slog.Warn("bronze transform failed", "file", path, "err", err)
+			}
+		}
+	}
+	wg.Add(workers)
+	for range workers {
+		go worker()
+	}
+send:
+	for _, path := range files {
+		select {
+		case jobs <- path:
+		case <-ctx.Done():
+			break send
+		}
+	}
+	close(jobs)
+	wg.Wait()
 
 	if done > 0 || failed > 0 {
 		slog.Info("bronze",
@@ -190,34 +228,52 @@ func transformFile(lake, rawFile, outFile string) (int, error) {
 		return 0, err
 	}
 
-	var msg gtfs.FeedMessage
-	if err := proto.Unmarshal(data, &msg); err != nil {
-		return 0, fmt.Errorf("unmarshal: %w", err)
-	}
-
 	agency, feedName := agencyAndFeed(lake, rawFile)
-	feedTS := int64(msg.GetHeader().GetTimestamp())
-
-	var rows []any
-	switch feedName {
-	case "vehicle_positions":
-		rows = vehicleRows(&msg, agency, feedTS)
-	case "trip_updates":
-		rows = stopTimeRows(&msg, agency, feedTS)
-	default:
-		// alerts and anything else: not modelled yet. Raw is still kept, so
-		// this becomes a re-run whenever we decide to parse them.
+	rowCount, write, err := decodeSnapshot(data, agency, feedName)
+	if err != nil {
+		return 0, err
+	}
+	if write == nil {
 		return 0, nil
 	}
-
 	if err := os.MkdirAll(filepath.Dir(outFile), 0o755); err != nil {
 		return 0, err
 	}
-	return len(rows), writeNDJSON(outFile, rows)
+	return rowCount, write(outFile)
 }
 
-func vehicleRows(msg *gtfs.FeedMessage, agency string, feedTS int64) []any {
-	rows := make([]any, 0, len(msg.GetEntity()))
+// decodeSnapshot contains no filesystem work. Keeping protobuf decoding and
+// row mapping separate from publication makes the transform easy to test and
+// ensures a failed decode can never create a bronze artifact.
+func decodeSnapshot(data []byte, agency, feedName string) (int, func(string) error, error) {
+	var msg gtfs.FeedMessage
+	if err := proto.Unmarshal(data, &msg); err != nil {
+		return 0, nil, fmt.Errorf("unmarshal: %w", err)
+	}
+
+	feedTS := int64(msg.GetHeader().GetTimestamp())
+
+	var write func(string) error
+	var rowCount int
+	switch feedName {
+	case "vehicle_positions":
+		rows := vehicleRows(&msg, agency, feedTS)
+		rowCount = len(rows)
+		write = func(path string) error { return writeNDJSON(path, rows) }
+	case "trip_updates":
+		rows := stopTimeRows(&msg, agency, feedTS)
+		rowCount = len(rows)
+		write = func(path string) error { return writeNDJSON(path, rows) }
+	default:
+		// alerts and anything else: not modelled yet. Raw is still kept, so
+		// this becomes a re-run whenever we decide to parse them.
+		return 0, nil, nil
+	}
+	return rowCount, write, nil
+}
+
+func vehicleRows(msg *gtfs.FeedMessage, agency string, feedTS int64) []vehicleRow {
+	rows := make([]vehicleRow, 0, len(msg.GetEntity()))
 	for _, ent := range msg.GetEntity() {
 		vp := ent.GetVehicle()
 		if vp == nil {
@@ -260,8 +316,8 @@ func vehicleRows(msg *gtfs.FeedMessage, agency string, feedTS int64) []any {
 	return rows
 }
 
-func stopTimeRows(msg *gtfs.FeedMessage, agency string, feedTS int64) []any {
-	var rows []any
+func stopTimeRows(msg *gtfs.FeedMessage, agency string, feedTS int64) []stopTimeRow {
+	rows := make([]stopTimeRow, 0)
 	for _, ent := range msg.GetEntity() {
 		tu := ent.GetTripUpdate()
 		if tu == nil {
@@ -317,7 +373,7 @@ func stopTimeRows(msg *gtfs.FeedMessage, agency string, feedTS int64) []any {
 
 // writeNDJSON publishes atomically, same as ingest: a half-written bronze file
 // would otherwise be indistinguishable from a complete one to a query.
-func writeNDJSON(outFile string, rows []any) error {
+func writeNDJSON[T any](outFile string, rows []T) error {
 	dir := filepath.Dir(outFile)
 	tmp, err := os.CreateTemp(dir, ".partial-*")
 	if err != nil {
@@ -327,8 +383,8 @@ func writeNDJSON(outFile string, rows []any) error {
 	defer func() { _ = os.Remove(tmpName) }()
 
 	enc := json.NewEncoder(tmp)
-	for _, r := range rows {
-		if err := enc.Encode(r); err != nil {
+	for _, row := range rows {
+		if err := enc.Encode(row); err != nil {
 			_ = tmp.Close()
 			return err
 		}

@@ -1,8 +1,8 @@
 // Shared browser-side runtime for every chandb page.
 //
 // The query engine runs here, in the visitor's tab — the server is a static
-// file host. boot() brings DuckDB-WASM up, registers each published Parquet
-// partition by URL, and exposes one view per dataset.
+// file host. boot() runs the explicit engine, catalog, and registration phases
+// and exposes one view per dataset.
 //
 // Both pages import this rather than duplicating the setup, so a change to
 // how datasets are registered lands everywhere at once.
@@ -14,13 +14,7 @@ import * as duckdb from 'https://cdn.jsdelivr.net/npm/@duckdb/duckdb-wasm@1.32.0
 // The DuckDB-WASM bundle is ~34MB. That is a one-time, browser-cached cost,
 // but it is long enough on a slow link that a silent page looks hung — so
 // instantiate reports download progress and every caller surfaces it.
-export async function boot(onProgress) {
-  // Phase timings, so a slow start says WHICH part was slow. The engine
-  // bundle is ~34MB and dominates a cold load; dataset registration is a
-  // handful of HTTP range requests. Without this split, every slow boot looks
-  // identical and is diagnosed by guesswork.
-  const t = { start: performance.now() };
-
+export async function startEngine(onProgress) {
   const bundles = duckdb.getJsDelivrBundles();
   const bundle = await duckdb.selectBundle(bundles);
 
@@ -38,11 +32,17 @@ export async function boot(onProgress) {
   });
   URL.revokeObjectURL(workerURL);
 
-  t.engine = performance.now();
+  return { db, conn: await db.connect() };
+}
 
-  const conn = await db.connect();
+export async function loadCatalog() {
+  const response = await fetch('/api/datasets');
+  if (!response.ok) throw new Error(`dataset catalog: HTTP ${response.status}`);
+  return response.json();
+}
+
+export async function registerDatasets(db, conn, sets, onProgress) {
   if (onProgress) onProgress(-1, -1);   // engine up; registering datasets now
-  const sets = await (await fetch('/api/datasets')).json();
 
   const available = new Set();
   let bytes = 0, files = 0;
@@ -67,14 +67,23 @@ export async function boot(onProgress) {
     files += ds.files.length;
   }
 
-  t.datasets = performance.now();
+  return { available, bytes, files };
+}
+
+export async function boot(onProgress) {
+  const start = performance.now();
+  const engine = await startEngine(onProgress);
+  const engineDone = performance.now();
+  const sets = await loadCatalog();
+  const catalogDone = performance.now();
+  const registered = await registerDatasets(engine.db, engine.conn, sets, onProgress);
   const timings = {
-    engineMs:   Math.round(t.engine - t.start),
-    datasetsMs: Math.round(t.datasets - t.engine),
+    engineMs: Math.round(engineDone - start),
+    catalogMs: Math.round(catalogDone - engineDone),
+    datasetsMs: Math.round(performance.now() - catalogDone),
   };
   console.info('chandb boot', timings);
-
-  return { db, conn, available, bytes, files, timings };
+  return { ...engine, ...registered, timings };
 }
 
 // columnsOf returns the column names of a view as a Set.

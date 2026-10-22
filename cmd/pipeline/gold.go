@@ -205,6 +205,13 @@ var goldTables = []goldTable{
 	// BART publishes no vehicle positions, so its TripUpdates are the only
 	// signal about where its trains are and whether they are late.
 	{agency: "bart", source: "trip_updates", out: "stop_events", query: stopEventsQuery},
+	{agency: "septa", source: "vehicle_positions", out: "vehicle_positions", query: goldQuery},
+	{agency: "septa", source: "trip_updates", out: "stop_events", query: stopEventsQuery},
+	{agency: "septarail", source: "vehicle_positions", out: "vehicle_positions", query: goldQuery},
+	// Regional Rail predictions have no stop_id or arrival_time, so stop_name
+	// and lead_time_s come out NULL and the board skips them. The per-trip
+	// delay is still worth archiving.
+	{agency: "septarail", source: "trip_updates", out: "stop_events", query: stopEventsQuery},
 }
 
 func transformGold(ctx context.Context, lake string) {
@@ -215,7 +222,6 @@ func transformGold(ctx context.Context, lake string) {
 	}
 	defer func() { _ = db.Close() }()
 
-	today := "dt=" + time.Now().UTC().Format("2006-01-02")
 	var built int
 	start := time.Now()
 
@@ -256,9 +262,11 @@ func transformGold(ctx context.Context, lake string) {
 				outDir := filepath.Join(lake, "gold", tbl.agency, tbl.out, name)
 				outFile := filepath.Join(outDir, "part-0.parquet")
 
-				// Past days are complete, so an existing file is final.
-				// Today's is still accumulating, so rebuild it every cycle.
-				if _, err := os.Stat(outFile); err == nil && name != today {
+				// A partition's directory mtime advances when a bronze
+				// snapshot is published. Use it as a cheap watermark: this
+				// avoids rebuilding today's gold when a cycle fetched nothing,
+				// while still rebuilding after late-arriving bronze data.
+				if !goldPartitionChanged(filepath.Join(srcRoot, name), outFile) {
 					continue
 				}
 				if err := os.MkdirAll(outDir, 0o755); err != nil {
@@ -283,6 +291,18 @@ func transformGold(ctx context.Context, lake string) {
 		slog.Info("gold", "partitions", built,
 			"elapsed", time.Since(start).Round(time.Millisecond))
 	}
+}
+
+func goldPartitionChanged(srcDir, outFile string) bool {
+	out, err := os.Stat(outFile)
+	if err != nil {
+		return true
+	}
+	src, err := os.Stat(srcDir)
+	if err != nil {
+		return false
+	}
+	return src.ModTime().After(out.ModTime())
 }
 
 // goldAgencies lists the agencies with gold tables, in a stable order so logs
