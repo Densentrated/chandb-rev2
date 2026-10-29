@@ -6,7 +6,8 @@
   --ink-dim: #8e8a80;
   --ink-faint: #514e49;
   --line: #22222a;
-  --accent: #ffb000;
+  --accent: #4ad5ff;
+  --accent-secondary: #ff5f8d;
   --accent-soft: color-mix(in srgb, var(--accent) 14%, transparent);
   --danger: #ff6b7d;
   --mono: "Berkeley Mono", "JetBrains Mono", "IBM Plex Mono",
@@ -118,7 +119,7 @@ main {
 }
 
 .eyebrow {
-  color: var(--accent);
+  color: var(--accent-secondary);
   font-size: 0.64rem;
   font-weight: 400;
   letter-spacing: 0.26em;
@@ -132,6 +133,15 @@ main {
   letter-spacing: -0.045em;
   line-height: 0.95;
   text-transform: uppercase;
+}
+
+.intro h2::after {
+  display: block;
+  width: min(12rem, 42vw);
+  height: 2px;
+  margin-top: 1.1rem;
+  background: linear-gradient(to right, var(--accent), var(--accent-secondary));
+  content: "";
 }
 
 .intro p,
@@ -157,7 +167,7 @@ footer,
 
 #status::before {
   margin-right: 0.7rem;
-  color: var(--accent);
+  color: var(--accent-secondary);
   content: ">";
 }
 
@@ -288,8 +298,8 @@ a { color: var(--accent); }
 .timeline::before { background: var(--line); }
 .timeline-dot {
   border-color: var(--bg-sink);
-  background: var(--accent);
-  box-shadow: 0 0 0 1px var(--accent);
+  background: var(--accent-secondary);
+  box-shadow: 0 0 0 1px var(--accent-secondary);
 }
 .timeline-card {
   border-color: var(--line);
@@ -298,7 +308,7 @@ a { color: var(--accent); }
 
 .map-card { overflow: hidden; }
 .map-head { border-bottom: 1px solid var(--line); }
-.count { color: var(--accent); }
+.count { color: var(--accent-secondary); }
 .map-note { border-top: 1px solid var(--line); }
 
 @media (max-width: 700px) {
