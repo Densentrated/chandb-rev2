@@ -11,7 +11,7 @@
   .map-head { padding:0.8rem 1rem; display:flex; justify-content:space-between; gap:1rem; align-items:baseline; }
   .map-head h3 { margin:0; font-size:0.9rem; }
   .count { font:0.68rem var(--mono); }
-  .map { height:360px; background:#d8e2ed; }
+  .map { height:360px; background:var(--bg-raise); }
   .map-note { padding:0.55rem 1rem; font-size:0.68rem; }
   @media (max-width:700px) { .maps { grid-template-columns:1fr; } .map { height:320px; } }
 </style>
@@ -76,6 +76,10 @@ function addVehicles(config, map, rows) {
   if (bounds.length && config.id !== 'world') map.fitBounds(bounds, { padding: [18, 18], maxZoom: 14 });
 }
 
+function selectColumn(cols, name, type = 'VARCHAR') {
+  return cols.has(name) ? name : `NULL::${type}`;
+}
+
 async function run() {
   try {
     const result = await boot((loaded, total) => {
@@ -83,13 +87,28 @@ async function run() {
       else if (loaded < 0) say('Query engine ready; registering datasets…');
     });
     const tables = [];
+    const columns = new Map();
     for (const table of result.available) {
       if (!table.endsWith('_vehicle_positions')) continue;
       const cols = await columnsOf(result.conn, table);
-      if (['agency', 'latitude', 'longitude', 'feed_timestamp'].every(c => cols.has(c))) tables.push(table);
+      if (['agency', 'latitude', 'longitude', 'feed_timestamp'].every(c => cols.has(c))) {
+        tables.push(table);
+        columns.set(table, cols);
+      }
     }
     if (!tables.length) throw new Error('No vehicle-position datasets are published yet');
-    const sql = tables.map(table => `SELECT * FROM ${table} WHERE feed_timestamp = (SELECT max(feed_timestamp) FROM ${table})`).join(' UNION ALL ');
+    const sql = tables.map(table => {
+      const cols = columns.get(table);
+      return `SELECT
+        agency, latitude, longitude, feed_timestamp,
+        ${selectColumn(cols, 'route_short_name')},
+        ${selectColumn(cols, 'route_long_name')},
+        ${selectColumn(cols, 'route_id')},
+        ${selectColumn(cols, 'trip_headsign')},
+        ${selectColumn(cols, 'route_color')}
+      FROM ${table}
+      WHERE feed_timestamp = (SELECT max(feed_timestamp) FROM ${table})`;
+    }).join(' UNION ALL ');
     const rows = rowsOf(await result.conn.query(sql));
     const maps = new Map(configs.map(config => [config.id, { config, map: makeMap(config) }]));
     for (const entry of maps.values()) addVehicles(entry.config, entry.map, rows);
