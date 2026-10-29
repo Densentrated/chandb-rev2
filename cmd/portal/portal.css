@@ -90,7 +90,11 @@ h1 {
   letter-spacing: 0.08em;
 }
 
-nav { gap: 1.25rem; }
+nav {
+  display: flex;
+  gap: 1.25rem;
+  flex: none;
+}
 
 nav a {
   padding: 0;
