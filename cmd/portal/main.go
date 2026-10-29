@@ -56,6 +56,9 @@ var indexHTML []byte
 //go:embed board.html
 var boardHTML []byte
 
+//go:embed maps.html
+var mapsHTML []byte
+
 // Shared browser runtime. Both pages import it, so the DuckDB-WASM setup and
 // dataset registration exist once rather than per page.
 //
@@ -77,6 +80,7 @@ var (
 	hashedJSPath string
 	indexPage    []byte
 	boardPage    []byte
+	mapsPage     []byte
 )
 
 func buildAssets() {
@@ -86,6 +90,7 @@ func buildAssets() {
 	ref := []byte("/chandb.js")
 	indexPage = bytes.ReplaceAll(indexHTML, ref, []byte(hashedJSPath))
 	boardPage = bytes.ReplaceAll(boardHTML, ref, []byte(hashedJSPath))
+	mapsPage = bytes.ReplaceAll(mapsHTML, ref, []byte(hashedJSPath))
 }
 
 func main() {
@@ -201,6 +206,7 @@ func portalRoutes(goldDir, jsType string) *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", handleHealthz)
 	mux.HandleFunc("GET /board", servePage(boardPage, "text/html; charset=utf-8"))
+	mux.HandleFunc("GET /maps", servePage(mapsPage, "text/html; charset=utf-8"))
 	mux.HandleFunc("GET "+hashedJSPath, serveImmutable(chandbJS, jsType))
 	mux.HandleFunc("GET /chandb.js", servePage(chandbJS, jsType))
 	mux.HandleFunc("GET /portal.css", servePage(portalCSS, "text/css; charset=utf-8"))
