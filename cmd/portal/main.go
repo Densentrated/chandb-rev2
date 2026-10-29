@@ -62,6 +62,9 @@ var boardHTML []byte
 //go:embed chandb.js
 var chandbJS []byte
 
+//go:embed portal.css
+var portalCSS []byte
+
 // Content-hashed asset URL, e.g. /chandb.3f9a1c2b4d5e.js
 //
 // The pages and the module they import are separate HTTP responses with
@@ -200,6 +203,7 @@ func portalRoutes(goldDir, jsType string) *http.ServeMux {
 	mux.HandleFunc("GET /board", servePage(boardPage, "text/html; charset=utf-8"))
 	mux.HandleFunc("GET "+hashedJSPath, serveImmutable(chandbJS, jsType))
 	mux.HandleFunc("GET /chandb.js", servePage(chandbJS, jsType))
+	mux.HandleFunc("GET /portal.css", servePage(portalCSS, "text/css; charset=utf-8"))
 	mux.HandleFunc("GET /api/datasets", newCatalog(goldDir).serveHTTP)
 	mux.Handle("GET /data/", http.StripPrefix("/data/", dataServer(goldDir)))
 	mux.HandleFunc("GET /", handleIndex)
