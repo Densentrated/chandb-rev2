@@ -4,7 +4,6 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>chandb — train maps</title>
-<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
 <style>
   .maps { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:1rem; }
   .head { display:flex; justify-content:space-between; gap:1.5rem; }
@@ -12,7 +11,8 @@
   .map-head { padding:0.8rem 1rem; display:flex; justify-content:space-between; gap:1rem; align-items:baseline; }
   .map-head h3 { margin:0; font-size:0.9rem; }
   .count { font:0.68rem var(--mono); }
-  .map { height:360px; background:var(--bg-raise); }
+  .map { position:relative; height:360px; overflow:hidden; background:var(--bg-raise); }
+  .map canvas { display:block; width:100%; height:100%; }
   .map-note { padding:0.55rem 1rem; font-size:0.68rem; }
   @media (max-width:700px) {
     .head { display:block; }
@@ -30,13 +30,12 @@
   <section class="intro"><div class="eyebrow">24-hour activity</div><h2>Where do trains run?</h2><p>Brighter areas have more observed train activity across the latest day of 30-minute snapshots. This is a pattern map, not a live position feed.</p></section>
   <div id="status" role="status" aria-live="polite" aria-busy="true">Starting the in-browser query engine…</div>
   <section class="maps">
-    <article class="map-card"><div class="map-head"><h3>Whole world</h3><span class="count" id="count-world">Loading…</span></div><div class="map" id="map-world"></div><div class="map-note">All agencies · brighter = more observations.</div></article>
+    <article class="map-card"><div class="map-head"><h3>Whole world</h3><span class="count" id="count-world">Loading…</span></div><div class="map" id="map-world"></div><div class="map-note">All agencies · brighter = more observations · self-contained canvas atlas with a dark grid.</div></article>
     <article class="map-card"><div class="map-head"><h3>Boston</h3><span class="count" id="count-boston">Loading…</span></div><div class="map" id="map-boston"></div><div class="map-note">MBTA · activity from the latest 24 hours.</div></article>
     <article class="map-card"><div class="map-head"><h3>San Francisco Bay Area</h3><span class="count" id="count-bay">Loading…</span></div><div class="map" id="map-bay"></div><div class="map-note">BART · activity appears when positions are published.</div></article>
     <article class="map-card"><div class="map-head"><h3>Philadelphia</h3><span class="count" id="count-philadelphia">Loading…</span></div><div class="map" id="map-philadelphia"></div><div class="map-note">SEPTA city and Regional Rail · latest 24 hours.</div></article>
   </section>
 </main>
-<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <script type="module">
 import { boot, columnsOf, rowsOf, fmtMB } from '/chandb.js';
 
@@ -48,18 +47,17 @@ const say = (text, error = false) => {
   status.setAttribute('aria-busy', error ? 'false' : 'true');
 };
 const configs = [
-  { id: 'world', center: [25, 0], zoom: 2, agencies: null },
-  { id: 'boston', center: [42.35, -71.08], zoom: 11, agencies: ['mbta'] },
-  { id: 'bay', center: [37.77, -122.25], zoom: 10, agencies: ['bart'] },
-  { id: 'philadelphia', center: [39.95, -75.16], zoom: 11, agencies: ['septa', 'septarail'] },
+  { id: 'world', bounds: [-180, 180, -60, 75], agencies: null },
+  { id: 'boston', bounds: [-72.5, -70.5, 41.5, 43], agencies: ['mbta'] },
+  { id: 'bay', bounds: [-123, -121, 37, 39], agencies: ['bart'] },
+  { id: 'philadelphia', bounds: [-76, -74.5, 39.3, 40.5], agencies: ['septa', 'septarail'] },
 ];
 
 function makeMap(config) {
-  const map = L.map(`map-${config.id}`, { scrollWheelZoom: false }).setView(config.center, config.zoom);
-  L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
-    maxZoom: 19, attribution: '&copy; OpenStreetMap contributors &copy; CARTO'
-  }).addTo(map);
-  return map;
+  const host = document.getElementById(`map-${config.id}`);
+  const canvas = document.createElement('canvas');
+  host.replaceChildren(canvas);
+  return { canvas, bounds: config.bounds };
 }
 
 function heatColor(ratio) {
@@ -68,22 +66,59 @@ function heatColor(ratio) {
 
 function addActivity(config, map, rows) {
   const selected = config.agencies ? rows.filter(row => config.agencies.includes(row.agency)) : rows;
-  const bounds = [];
+  const bounds = config.bounds;
   const max = Math.max(...selected.map(row => Number(row.observations)), 1);
+  const ctx = map.canvas.getContext('2d');
+  const width = map.canvas.clientWidth, height = map.canvas.clientHeight;
+  const scale = window.devicePixelRatio || 1;
+  map.canvas.width = width * scale;
+  map.canvas.height = height * scale;
+  ctx.scale(scale, scale);
+  ctx.fillStyle = '#101014';
+  ctx.fillRect(0, 0, width, height);
+
+  const project = (lon, lat) => [
+    ((lon - bounds[0]) / (bounds[1] - bounds[0])) * width,
+    ((bounds[3] - lat) / (bounds[3] - bounds[2])) * height,
+  ];
+  ctx.strokeStyle = '#22222a';
+  ctx.lineWidth = 1;
+  ctx.font = '10px ui-monospace, monospace';
+  ctx.fillStyle = '#52677a';
+  const lonStep = bounds[1] - bounds[0] > 100 ? 60 : 0.5;
+  const latStep = bounds[1] - bounds[0] > 100 ? 30 : 0.5;
+  for (let lon = Math.ceil(bounds[0] / lonStep) * lonStep; lon <= bounds[1]; lon += lonStep) {
+    const [x] = project(lon, bounds[2]);
+    ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, height); ctx.stroke();
+    ctx.fillText(`${lon}°`, x + 5, height - 8);
+  }
+  for (let lat = Math.ceil(bounds[2] / latStep) * latStep; lat <= bounds[3]; lat += latStep) {
+    const [, y] = project(bounds[0], lat);
+    ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(width, y); ctx.stroke();
+    ctx.fillText(`${lat}°`, 6, Math.max(12, y - 5));
+  }
+  ctx.strokeStyle = '#4ad5ff';
+  ctx.strokeRect(0.5, 0.5, width - 1, height - 1);
+
   for (const row of selected) {
     const lat = Number(row.latitude), lon = Number(row.longitude);
     if (!Number.isFinite(lat) || !Number.isFinite(lon)) continue;
     const ratio = Math.sqrt(Number(row.observations) / max);
-    bounds.push([lat, lon]);
-    L.circleMarker([lat, lon], {
-      radius: 7 + ratio * 13, color: heatColor(ratio), weight: 1,
-      fillColor: heatColor(ratio), fillOpacity: .18 + ratio * .55
-    }).bindPopup(`<strong>${Number(row.observations).toLocaleString()} observations</strong><br>${row.agency.toUpperCase()}`).addTo(map);
+    const [x, y] = project(lon, lat);
+    if (x < 0 || x > width || y < 0 || y > height) continue;
+    const radius = 3 + ratio * 12;
+    const color = heatColor(ratio);
+    const glow = ctx.createRadialGradient(x, y, 0, x, y, radius * 2.8);
+    glow.addColorStop(0, `${color}cc`);
+    glow.addColorStop(1, `${color}00`);
+    ctx.fillStyle = glow;
+    ctx.beginPath(); ctx.arc(x, y, radius * 2.8, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = color;
+    ctx.beginPath(); ctx.arc(x, y, radius, 0, Math.PI * 2); ctx.fill();
   }
   $(`count-${config.id}`).textContent = selected.length
     ? `${selected.length.toLocaleString()} activity cells`
     : 'No positions published';
-  if (bounds.length && config.id !== 'world') map.fitBounds(bounds, { padding: [18, 18], maxZoom: 14 });
 }
 
 async function run() {
