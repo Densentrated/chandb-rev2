@@ -139,6 +139,31 @@ func TestBoardPageIsServed(t *testing.T) {
 	if !strings.Contains(body, "stop_events") {
 		t.Error("board should query a stop_events table")
 	}
+	for _, want := range []string{"Show all departures", "timeline", "Back to board", "departure_delay"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("board visualization missing %q", want)
+		}
+	}
+}
+
+func TestMapsPageIsServed(t *testing.T) {
+	buildAssets()
+	rec := httptest.NewRecorder()
+	servePage(mapsPage, "text/html; charset=utf-8")(
+		rec, httptest.NewRequest(http.MethodGet, "/maps", nil))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, hashedJSPath) {
+		t.Error("maps should import the hashed shared runtime")
+	}
+	for _, want := range []string{"map-world", "map-boston", "map-bay", "map-philadelphia"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("maps page missing %q", want)
+		}
+	}
 }
 
 // A module delivered with the wrong Content-Type is refused by every browser,

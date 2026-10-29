@@ -2,7 +2,7 @@
 
 chandb-rev2 archives live transit data from **MBTA** (Boston), **BART** (SF
 Bay Area) and **SEPTA** (Philadelphia) and publishes it as a public website. On that site anyone can run SQL
-against the archive or look at a live departure board.
+against the archive, look at a live departure board, or view train positions on world and city maps.
 
 The whole system is two Go binaries built into one container image, a directory
 of files on disk (the "lake"), and some deploy plumbing:
@@ -47,6 +47,7 @@ explains why.
 | [cmd/portal/chandb.js](../cmd/portal/chandb.js) | Shared browser runtime (boots DuckDB-WASM, registers datasets) |
 | [cmd/portal/index.html](../cmd/portal/index.html) | SQL viewer page (`/`) |
 | [cmd/portal/board.html](../cmd/portal/board.html) | Departure board page (`/board`) |
+| [cmd/portal/maps.html](../cmd/portal/maps.html) | World and city train maps (`/maps`) |
 | [Dockerfile](../Dockerfile) | Builds both binaries into one image |
 | [deploy/docker-compose.yml](../deploy/docker-compose.yml) | Production stack: portal, pipeline, cloudflared |
 | [infra/ansible/playbook.yml](../infra/ansible/playbook.yml) | One-time VPS provisioning |
@@ -282,13 +283,14 @@ deleted. `gold/` is never touched.
 |---|---|---|
 | `GET /` | SQL viewer (`index.html`, embedded) | `no-cache` |
 | `GET /board` | Departure board (`board.html`, embedded) | `no-cache` |
+| `GET /maps` | World and city train maps (`maps.html`, embedded) | `no-cache` |
 | `GET /chandb.<hash>.js` | Shared JS module | `max-age=1y, immutable` |
 | `GET /chandb.js` | Same file without the hash, for pages cached from an older deploy | `no-cache` |
 | `GET /api/datasets` | Lists gold Parquet files, grouped as `<agency>_<table>` | 60 s |
 | `GET /data/…` | `http.FileServer` over **`/lake/gold` only** | 60 s for today's partition, 1 day + immutable for past ones |
 | `GET /healthz` | Returns `ok` | `no-store` |
 
-The three frontend files are compiled into the binary with `//go:embed`.
+The four frontend files are compiled into the binary with `//go:embed`.
 `buildAssets()` hashes `chandb.js` and rewrites the `/chandb.js` references in
 both pages to the hashed URL. This prevents a bug where a browser pairs a fresh
 page with a stale cached module. The mismatch fails as a parse-time

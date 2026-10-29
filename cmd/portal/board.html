@@ -10,6 +10,7 @@
     --fg: #edf3ff; --muted: #9caac3; --accent: #79b8ff; --focus: #b9d8ff;
     --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   }
+
   * { box-sizing: border-box; }
   body { margin: 0; background: var(--bg); color: var(--fg);
          font: 15px/1.5 system-ui, -apple-system, sans-serif; }
@@ -45,6 +46,10 @@
            grid-template-columns: repeat(auto-fill, minmax(340px, 1fr)); }
   .station { background: var(--panel); border: 1px solid var(--line);
              border-radius: 8px; padding: 12px 14px; }
+  .station:focus-within { border-color: var(--accent); box-shadow: 0 0 0 2px #79b8ff33; }
+  .station-trigger { display: block; width: 100%; padding: 0; border: 0; text-align: left;
+                     background: none; color: inherit; }
+  .station-trigger:hover { border-color: transparent; background: none; }
   .station h2 { margin: 0 0 8px; font-size: 14px; font-weight: 600;
                 display: flex; justify-content: space-between; gap: 8px; align-items: baseline; }
   .agency { font: 600 10px/1 var(--mono); color: var(--muted);
@@ -63,14 +68,33 @@
   .eta.past { color: var(--muted); font-weight: 400; }
   .empty { padding: 40px 18px; border: 1px dashed var(--line); border-radius: 8px; color: var(--muted); text-align: center; }
   .counts { color: var(--muted); font: 12px var(--mono); margin: -5px 0 13px; }
+  .detail[hidden] { display: none; }
+  .detail-head { display: flex; justify-content: space-between; gap: 16px; align-items: flex-start; margin-bottom: 18px; }
+  .detail-head h2 { margin: 0 0 3px; font-size: 21px; }
+  .detail-head p { margin: 0; color: var(--muted); font-size: 13px; }
+  .timeline { position: relative; padding: 26px 0 8px; overflow-x: auto; }
+  .timeline::before { content: ""; position: absolute; left: 10px; right: 10px; top: 68px; height: 2px; background: var(--line); }
+  .timeline-grid { position: relative; min-width: 680px; display: grid; grid-template-columns: repeat(6, 1fr); }
+  .tick { color: var(--muted); font: 11px var(--mono); border-left: 1px solid var(--line); padding-left: 6px; height: 20px; }
+  .timeline-items { position: relative; min-width: 680px; height: 270px; }
+  .timeline-item { position: absolute; top: 30px; transform: translateX(-50%); width: 142px; }
+  .timeline-dot { margin: 0 auto 12px; width: 14px; height: 14px; border-radius: 50%; background: var(--accent); border: 3px solid var(--panel); box-shadow: 0 0 0 1px var(--accent); }
+  .timeline-card { background: var(--panel-2); border: 1px solid var(--line); border-radius: 6px; padding: 7px 8px; font-size: 12px; }
+  .timeline-card strong { display: block; font: 700 13px var(--mono); }
+  .timeline-card .mode { color: var(--accent); font-weight: 600; }
+  .timeline-card .destination { color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .delay { color: #ffbd7a; font-size: 11px; }
+  .delay.good { color: #8ed6a2; }
+  .legend { color: var(--muted); font-size: 12px; margin-top: 4px; }
   @media (max-width: 700px) { .head { display: block; } nav { margin-top: 14px; } main { padding-top: 18px; } .controls { align-items: stretch; } input[type=search] { max-width: none; flex-basis: 100%; } .controls button { flex: 1; } .board { grid-template-columns: 1fr; } }
 </style>
+<link rel="stylesheet" href="/portal.css">
 </head>
 <body>
 <header><div class="head"><div><h1>chandb</h1>
   <div class="sub">
     Next arrivals per station across every agency in the lake.
-  </div></div><nav aria-label="Primary"><a href="/">SQL explorer</a><a href="/board" aria-current="page">Departure board</a></nav></div></header>
+  </div></div><nav aria-label="Primary"><a href="/">SQL explorer</a><a href="/board" aria-current="page">Departure board</a><a href="/maps">Train maps</a></nav></div></header>
 
 <main>
   <section class="intro"><div class="eyebrow">Live-ish snapshot</div><h2>Find the next departure</h2><p>Browse the latest published arrivals. Times are relative to each agency's newest snapshot.</p></section>
@@ -87,15 +111,22 @@
   <div id="counts" class="counts" aria-live="polite"></div>
 
   <div class="board" id="board"><div class="empty">Loading arrivals…</div></div>
+  <section class="detail" id="detail" hidden aria-labelledby="detail-title">
+    <div class="detail-head">
+      <div><h2 id="detail-title"></h2><p id="detail-summary"></p></div>
+      <button id="detail-close" type="button">← Back to board</button>
+    </div>
+    <div id="timeline" class="timeline" aria-live="polite"></div>
+  </section>
 </main>
-<link rel="stylesheet" href="/portal.css">
 
 <script type="module">
-import { boot, columnsOf, fmtEta, vehicleIcon, typeFromRouteType, fmtMB, rowsOf } from '/chandb.js';
+import { boot, columnsOf, fmtEta, fmtDuration, vehicleIcon, typeFromRouteType, fmtMB, rowsOf } from '/chandb.js';
 
 const $ = (id) => document.getElementById(id);
 const statusEl = $('status'), boardEl = $('board'), filterEl = $('filter'),
-      countsEl = $('counts'), clearEl = $('clear');
+      countsEl = $('counts'), clearEl = $('clear'), detailEl = $('detail'),
+      timelineEl = $('timeline'), detailClose = $('detail-close');
 
 const say = (msg, isErr = false) => {
   statusEl.textContent = msg;
@@ -106,6 +137,7 @@ const say = (msg, isErr = false) => {
 let conn, rows = [], human = true, bootNote = '';
 let agencies = [], agencyFilter = null;   // null = show every agency
 let types = [], typeFilter = null;        // null = show every vehicle type
+let selectedStation = null, previousFocus = null;
 
 // Rail first: a rider looking for the Orange Line should not have to scroll
 // past four hundred bus stops to find it.
@@ -162,17 +194,80 @@ SELECT '${table.split('_')[0]}' AS agency,
        ${cols.has('route_type')   ? 'route_type'   : 'NULL AS route_type'},
        trip_headsign,
        arrival_time,
-       arrival_time - (SELECT max(last_seen) FROM ${table}) AS seconds_away
+       ${cols.has('departure_time') ? 'departure_time' : 'NULL AS departure_time'},
+       ${cols.has('arrival_delay') ? 'arrival_delay' : 'NULL AS arrival_delay'},
+       ${cols.has('departure_delay') ? 'departure_delay' : 'NULL AS departure_delay'},
+       coalesce(${cols.has('departure_time') ? 'departure_time' : 'NULL'}, arrival_time) -
+         (SELECT max(last_seen) FROM ${table}) AS seconds_away
 FROM ${table}
 WHERE stop_name    IS NOT NULL
-  AND arrival_time IS NOT NULL
-  AND arrival_time BETWEEN (SELECT max(last_seen) FROM ${table}) - 600
-                       AND (SELECT max(last_seen) FROM ${table}) + 3600`;
+  AND coalesce(${cols.has('departure_time') ? 'departure_time' : 'NULL'}, arrival_time) IS NOT NULL
+  AND coalesce(${cols.has('departure_time') ? 'departure_time' : 'NULL'}, arrival_time)
+      BETWEEN (SELECT max(last_seen) FROM ${table}) - 600
+          AND (SELECT max(last_seen) FROM ${table}) + 3600`;
 
 // MBTA alone publishes ~5,800 stops. Rendering a card for every one is tens
 // of thousands of DOM nodes and a visibly janky page, so the board shows a
 // window and the filter box is how you narrow it.
 const MAX_STATIONS = 60;
+
+function delayText(d) {
+  const delay = d.departure_delay ?? d.arrival_delay;
+  if (delay === null || delay === undefined || !Number.isFinite(Number(delay))) return 'Delay unavailable';
+  const n = Number(delay);
+  if (Math.abs(n) < 30) return 'On time';
+  return n > 0 ? `${fmtDuration(n)} late` : `${fmtDuration(-n)} early`;
+}
+
+function showDetail(station, focus) {
+  selectedStation = station;
+  previousFocus = focus || document.activeElement;
+  const deps = rows.filter(d => d.agency === station.agency && d.stop_name === station.stop_name &&
+    (!agencyFilter || d.agency === agencyFilter) && (!typeFilter || d.kind === typeFilter))
+    .sort((a, b) => (a.seconds_away - b.seconds_away));
+  $('detail-title').textContent = station.stop_name;
+  $('detail-summary').textContent = `${station.agency.toUpperCase()} · ${deps.length} available departures`;
+  timelineEl.replaceChildren();
+  if (!deps.length) {
+    timelineEl.innerHTML = '<div class="empty">No departures match the current filters. Try clearing a filter or refresh the snapshot.</div>';
+  } else {
+    const times = deps.map(d => Number(d.seconds_away)).filter(Number.isFinite);
+    const min = Math.min(...times, 0), max = Math.max(...times, 3600), span = Math.max(max - min, 3600);
+    const ticks = document.createElement('div'); ticks.className = 'timeline-grid';
+    for (let i = 0; i < 6; i++) {
+      const tick = document.createElement('span'); tick.className = 'tick';
+      tick.textContent = human ? fmtEta(min + span * i / 5) : String(Math.round(min + span * i / 5));
+      ticks.appendChild(tick);
+    }
+    const items = document.createElement('div'); items.className = 'timeline-items';
+    for (const [i, d] of deps.entries()) {
+      const item = document.createElement('div'); item.className = 'timeline-item';
+      item.style.top = `${30 + (i % 3) * 78}px`;
+      item.style.left = `${Math.max(3, Math.min(97, ((d.seconds_away - min) / span) * 100))}%`;
+      const dot = document.createElement('div'); dot.className = 'timeline-dot';
+      const card = document.createElement('div'); card.className = 'timeline-card';
+      const time = document.createElement('strong');
+      time.textContent = human ? fmtEta(d.seconds_away) : String(d.departure_time ?? d.arrival_time);
+      const mode = document.createElement('span'); mode.className = 'mode';
+      mode.textContent = `${vehicleIcon(d.kind)} ${d.route ?? '?'} · ${d.kind}`;
+      const destination = document.createElement('div'); destination.className = 'destination';
+      destination.textContent = `to ${d.trip_headsign || 'Destination unavailable'}`;
+      const delay = document.createElement('div'); delay.className = 'delay' + (delayText(d) === 'On time' ? ' good' : '');
+      delay.textContent = delayText(d);
+      card.append(time, mode, destination, delay); item.append(dot, card); items.appendChild(item);
+    }
+    const legend = document.createElement('div'); legend.className = 'legend';
+    legend.textContent = 'Earlier departures are left; each marker shows route, mode, destination and reported delay.';
+    timelineEl.append(ticks, items, legend);
+  }
+  boardEl.hidden = true; detailEl.hidden = false; filterEl.setAttribute('aria-hidden', 'true');
+  detailClose.focus();
+}
+
+function closeDetail() {
+  selectedStation = null; detailEl.hidden = true; boardEl.hidden = false; filterEl.removeAttribute('aria-hidden');
+  if (previousFocus && document.contains(previousFocus)) previousFocus.focus();
+}
 
 function render() {
   const q = filterEl.value.trim().toLowerCase();
@@ -213,6 +308,11 @@ function render() {
     if (drawn++ >= MAX_STATIONS) break;
     const card = document.createElement('section');
     card.className = 'station';
+    const trigger = document.createElement('button');
+    trigger.className = 'station-trigger';
+    trigger.type = 'button';
+    trigger.setAttribute('aria-label', `Show all departures from ${deps[0].stop_name}`);
+    trigger.onclick = () => showDetail(deps[0], trigger);
 
     const h = document.createElement('h2');
     h.textContent = deps[0].stop_name;    // textContent: upstream names, never innerHTML
@@ -220,7 +320,7 @@ function render() {
     badge.className = 'agency';
     badge.textContent = deps[0].agency.toUpperCase();
     h.appendChild(badge);
-    card.appendChild(h);
+    trigger.appendChild(h);
 
     for (const d of deps) {
       const row = document.createElement('div');
@@ -247,8 +347,9 @@ function render() {
         : String(d.arrival_time);         // raw epoch seconds, as stored
 
       row.append(ico, mid, eta);
-      card.appendChild(row);
+      trigger.appendChild(row);
     }
+    card.appendChild(trigger);
     boardEl.appendChild(card);
   }
 
@@ -310,6 +411,10 @@ try {
 }
 
 filterEl.addEventListener('input', render);
+detailClose.onclick = closeDetail;
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape' && !detailEl.hidden) closeDetail();
+});
 clearEl.onclick = () => {
   filterEl.value = '';
   agencyFilter = null;
