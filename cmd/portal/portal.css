@@ -310,6 +310,9 @@ a { color: var(--accent); }
 .map-head { border-bottom: 1px solid var(--line); }
 .count { color: var(--accent-secondary); }
 .map-note { border-top: 1px solid var(--line); }
+.map { background: var(--bg-raise); }
+.delay { color: var(--accent-secondary); }
+.delay.good { color: var(--accent); }
 
 @media (max-width: 700px) {
   header { padding: 0 var(--pad); }

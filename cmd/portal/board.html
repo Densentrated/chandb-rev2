@@ -5,12 +5,6 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>chandb — departure board</title>
 <style>
-  :root {
-    --bg: #0b1020; --panel: #121a2b; --panel-2: #18243a; --line: #283653;
-    --fg: #edf3ff; --muted: #9caac3; --accent: #79b8ff; --focus: #b9d8ff;
-    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-  }
-
   * { box-sizing: border-box; }
   body { margin: 0; background: var(--bg); color: var(--fg);
          font: 15px/1.5 system-ui, -apple-system, sans-serif; }
@@ -83,8 +77,8 @@
   .timeline-card strong { display: block; font: 700 13px var(--mono); }
   .timeline-card .mode { color: var(--accent); font-weight: 600; }
   .timeline-card .destination { color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .delay { color: #ffbd7a; font-size: 11px; }
-  .delay.good { color: #8ed6a2; }
+  .delay { color: var(--accent-secondary); font-size: 11px; }
+  .delay.good { color: var(--accent); }
   .legend { color: var(--muted); font-size: 12px; margin-top: 4px; }
   @media (max-width: 700px) { .head { display: block; } nav { margin-top: 14px; } main { padding-top: 18px; } .controls { align-items: stretch; } input[type=search] { max-width: none; flex-basis: 100%; } .controls button { flex: 1; } .board { grid-template-columns: 1fr; } }
 </style>
