@@ -162,6 +162,7 @@ func TestMapsPageIsServed(t *testing.T) {
 	for _, want := range []string{
 		"map-world", "map-boston", "map-bay", "map-philadelphia",
 		"24-hour activity", "activity cells", "San Francisco Bay Area",
+		"canvas", "dark grid",
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("maps page missing %q", want)
