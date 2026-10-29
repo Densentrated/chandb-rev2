@@ -159,7 +159,10 @@ func TestMapsPageIsServed(t *testing.T) {
 	if !strings.Contains(body, hashedJSPath) {
 		t.Error("maps should import the hashed shared runtime")
 	}
-	for _, want := range []string{"map-world", "map-boston", "map-bay", "map-philadelphia"} {
+	for _, want := range []string{
+		"map-world", "map-boston", "map-bay", "map-philadelphia",
+		"24-hour activity", "activity cells", "San Francisco Bay Area",
+	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("maps page missing %q", want)
 		}

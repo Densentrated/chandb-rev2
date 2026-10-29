@@ -23,17 +23,17 @@
 <link rel="stylesheet" href="/portal.css">
 </head>
 <body>
-<header><div class="head"><div><h1>chandb</h1><div class="sub">Train locations from the newest published snapshot.</div></div>
+<header><div class="head"><div><h1>chandb</h1><div class="sub">Train activity across the latest 24 hours of snapshots.</div></div>
   <nav aria-label="Primary"><a href="/">SQL explorer</a><a href="/board">Departure board</a><a href="/maps" aria-current="page">Train maps</a></nav>
 </div></header>
 <main>
-  <section class="intro"><div class="eyebrow">Realtime vehicle positions</div><h2>Where are the trains?</h2><p>Each marker is a vehicle in the latest snapshot for that city. BART positions appear when the 511 feed is configured.</p></section>
+  <section class="intro"><div class="eyebrow">24-hour activity</div><h2>Where do trains run?</h2><p>Brighter areas have more observed train activity across the latest day of 30-minute snapshots. This is a pattern map, not a live position feed.</p></section>
   <div id="status" role="status" aria-live="polite" aria-busy="true">Starting the in-browser query engine…</div>
   <section class="maps">
-    <article class="map-card"><div class="map-head"><h3>Whole world</h3><span class="count" id="count-world">Loading…</span></div><div class="map" id="map-world"></div><div class="map-note">All agencies with published vehicle positions.</div></article>
-    <article class="map-card"><div class="map-head"><h3>Boston</h3><span class="count" id="count-boston">Loading…</span></div><div class="map" id="map-boston"></div><div class="map-note">MBTA vehicles.</div></article>
-    <article class="map-card"><div class="map-head"><h3>San Francisco Bay Area</h3><span class="count" id="count-bay">Loading…</span></div><div class="map" id="map-bay"></div><div class="map-note">BART vehicles, when available.</div></article>
-    <article class="map-card"><div class="map-head"><h3>Philadelphia</h3><span class="count" id="count-philadelphia">Loading…</span></div><div class="map" id="map-philadelphia"></div><div class="map-note">SEPTA city and Regional Rail vehicles.</div></article>
+    <article class="map-card"><div class="map-head"><h3>Whole world</h3><span class="count" id="count-world">Loading…</span></div><div class="map" id="map-world"></div><div class="map-note">All agencies · brighter = more observations.</div></article>
+    <article class="map-card"><div class="map-head"><h3>Boston</h3><span class="count" id="count-boston">Loading…</span></div><div class="map" id="map-boston"></div><div class="map-note">MBTA · activity from the latest 24 hours.</div></article>
+    <article class="map-card"><div class="map-head"><h3>San Francisco Bay Area</h3><span class="count" id="count-bay">Loading…</span></div><div class="map" id="map-bay"></div><div class="map-note">BART · activity appears when positions are published.</div></article>
+    <article class="map-card"><div class="map-head"><h3>Philadelphia</h3><span class="count" id="count-philadelphia">Loading…</span></div><div class="map" id="map-philadelphia"></div><div class="map-note">SEPTA city and Regional Rail · latest 24 hours.</div></article>
   </section>
 </main>
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
@@ -56,35 +56,34 @@ const configs = [
 
 function makeMap(config) {
   const map = L.map(`map-${config.id}`, { scrollWheelZoom: false }).setView(config.center, config.zoom);
-  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-    maxZoom: 19, attribution: '&copy; OpenStreetMap contributors'
+  L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
+    maxZoom: 19, attribution: '&copy; OpenStreetMap contributors &copy; CARTO'
   }).addTo(map);
   return map;
 }
 
-function label(row) {
-  const route = row.route_short_name || row.route_long_name || row.route_id || 'Train';
-  return `<strong>${route}</strong><br>${row.trip_headsign || 'Destination unavailable'}<br>${row.agency.toUpperCase()}`;
+function heatColor(ratio) {
+  return `hsl(${190 + Math.round(ratio * 140)} 88% 64%)`;
 }
 
-function addVehicles(config, map, rows) {
+function addActivity(config, map, rows) {
   const selected = config.agencies ? rows.filter(row => config.agencies.includes(row.agency)) : rows;
   const bounds = [];
+  const max = Math.max(...selected.map(row => Number(row.observations)), 1);
   for (const row of selected) {
     const lat = Number(row.latitude), lon = Number(row.longitude);
     if (!Number.isFinite(lat) || !Number.isFinite(lon)) continue;
+    const ratio = Math.sqrt(Number(row.observations) / max);
     bounds.push([lat, lon]);
-    L.circleMarker([lat, lon], { radius: 6, color: '#0b1020', weight: 1, fillColor: row.route_color ? `#${row.route_color}` : '#4f9cf5', fillOpacity: .9 })
-      .bindPopup(label(row)).addTo(map);
+    L.circleMarker([lat, lon], {
+      radius: 7 + ratio * 13, color: heatColor(ratio), weight: 1,
+      fillColor: heatColor(ratio), fillOpacity: .18 + ratio * .55
+    }).bindPopup(`<strong>${Number(row.observations).toLocaleString()} observations</strong><br>${row.agency.toUpperCase()}`).addTo(map);
   }
   $(`count-${config.id}`).textContent = selected.length
-    ? `${selected.length} vehicle${selected.length === 1 ? '' : 's'}`
+    ? `${selected.length.toLocaleString()} activity cells`
     : 'No positions published';
   if (bounds.length && config.id !== 'world') map.fitBounds(bounds, { padding: [18, 18], maxZoom: 14 });
-}
-
-function selectColumn(cols, name, type = 'VARCHAR') {
-  return cols.has(name) ? name : `NULL::${type}`;
 }
 
 async function run() {
@@ -94,32 +93,27 @@ async function run() {
       else if (loaded < 0) say('Query engine ready; registering datasets…');
     });
     const tables = [];
-    const columns = new Map();
     for (const table of result.available) {
       if (!table.endsWith('_vehicle_positions')) continue;
       const cols = await columnsOf(result.conn, table);
       if (['agency', 'latitude', 'longitude', 'feed_timestamp'].every(c => cols.has(c))) {
         tables.push(table);
-        columns.set(table, cols);
       }
     }
     if (!tables.length) throw new Error('No vehicle-position datasets are published yet');
-    const sql = tables.map(table => {
-      const cols = columns.get(table);
-      return `SELECT
-        agency, latitude, longitude, feed_timestamp,
-        ${selectColumn(cols, 'route_short_name')},
-        ${selectColumn(cols, 'route_long_name')},
-        ${selectColumn(cols, 'route_id')},
-        ${selectColumn(cols, 'trip_headsign')},
-        ${selectColumn(cols, 'route_color')}
+    const sql = tables.map(table => `
+      SELECT agency,
+             floor(latitude * 100) / 100 AS latitude,
+             floor(longitude * 100) / 100 AS longitude,
+             count(*) AS observations
       FROM ${table}
-      WHERE feed_timestamp = (SELECT max(feed_timestamp) FROM ${table})`;
-    }).join(' UNION ALL ');
+      WHERE feed_timestamp >= (SELECT max(feed_timestamp) FROM ${table}) - 86400
+      GROUP BY agency, latitude, longitude
+    `).join(' UNION ALL ');
     const rows = rowsOf(await result.conn.query(sql));
     const maps = new Map(configs.map(config => [config.id, { config, map: makeMap(config) }]));
-    for (const entry of maps.values()) addVehicles(entry.config, entry.map, rows);
-    say(`Ready · ${rows.length} vehicles · ${fmtMB(result.bytes)} MB across ${tables.length} datasets`);
+    for (const entry of maps.values()) addActivity(entry.config, entry.map, rows);
+    say(`Ready · ${rows.length.toLocaleString()} activity cells · latest 24 hours · ${fmtMB(result.bytes)} MB`);
     status.setAttribute('aria-busy', 'false');
   } catch (error) {
     say(`Unable to load train positions: ${error.message}`, true);
