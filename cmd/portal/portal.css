@@ -17,7 +17,10 @@
   --measure: 68ch;
 }
 
-* { border-radius: 0 !important; }
+* {
+  box-sizing: border-box;
+  border-radius: 0 !important;
+}
 
 html {
   background: var(--bg);
@@ -27,6 +30,7 @@ html {
 body {
   position: relative;
   min-height: 100vh;
+  margin: 0;
   background: var(--bg);
   color: var(--ink);
   font-family: var(--mono);
@@ -69,8 +73,12 @@ header {
 }
 
 .head {
+  display: flex;
+  justify-content: space-between;
+  gap: 1.5rem;
   min-height: var(--bar);
   max-width: 1360px;
+  margin-inline: auto;
   align-items: center;
 }
 
@@ -102,6 +110,7 @@ nav a {
   color: var(--ink-dim);
   font-size: 0.64rem;
   letter-spacing: 0.16em;
+  text-decoration: none;
   text-transform: uppercase;
 }
 
@@ -114,6 +123,7 @@ nav a:hover {
 
 main {
   max-width: 1400px;
+  margin-inline: auto;
   padding: clamp(2.5rem, 7vh, 5rem) var(--pad) 7rem;
 }
 
@@ -181,6 +191,8 @@ footer,
   color: var(--danger);
 }
 
+#status[aria-busy="true"] { border-color: var(--accent-soft); }
+
 textarea,
 input[type="search"] {
   border: 1px solid var(--line);
@@ -202,9 +214,11 @@ input[type="search"]:focus {
 }
 
 button {
+  padding: 0.5rem 1rem;
   border: 1px solid var(--accent);
   background: transparent;
   color: var(--accent);
+  cursor: pointer;
   font-family: var(--mono);
   font-size: 0.68rem;
   font-weight: 400;
@@ -216,6 +230,11 @@ button {
 button:hover:not(:disabled) {
   background: var(--accent);
   color: var(--bg);
+}
+
+button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
 }
 
 button:focus-visible,
@@ -320,7 +339,7 @@ a { color: var(--accent); }
 
 @media (max-width: 700px) {
   header { padding: 0 var(--pad); }
-  .head { padding: 0; }
+  .head { display: block; padding: 0; }
   nav { flex-wrap: wrap; gap: 0.8rem 1rem; padding: 0.65rem 0; }
   main { padding-top: 2.5rem; }
   .intro h2 { font-size: clamp(2rem, 12vw, 3.5rem); }

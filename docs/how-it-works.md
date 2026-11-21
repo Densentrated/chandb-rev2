@@ -45,20 +45,20 @@ explains why.
 | [cmd/pipeline/prune.go](../cmd/pipeline/prune.go) | Retention: deletes old raw/bronze partitions |
 | [cmd/portal/main.go](../cmd/portal/main.go) | HTTP server: pages, dataset listing, Parquet files |
 | [cmd/portal/chandb.js](../cmd/portal/chandb.js) | Shared browser runtime (boots DuckDB-WASM, registers datasets) |
-| [cmd/portal/index.html](../cmd/portal/index.html) | SQL viewer page (`/`) |
-| [cmd/portal/board.html](../cmd/portal/board.html) | Departure board page (`/board`) |
-| [cmd/portal/maps.html](../cmd/portal/maps.html) | World and city train maps (`/maps`) |
+| [cmd/portal/index.html](../cmd/portal/index.html) + [index.js](../cmd/portal/index.js) | SQL viewer page (`/`) |
+| [cmd/portal/board.html](../cmd/portal/board.html) + [board.js](../cmd/portal/board.js) | Departure board page (`/board`) |
+| [cmd/portal/maps.html](../cmd/portal/maps.html) + [maps.js](../cmd/portal/maps.js) | World and city train maps (`/maps`) |
+| [cmd/portal/portal.css](../cmd/portal/portal.css) | The single stylesheet: design tokens plus all shared chrome |
 | [Dockerfile](../Dockerfile) | Builds both binaries into one image |
+| [Makefile](../Makefile) | Task runner — `make help` lists everything |
 | [deploy/docker-compose.yml](../deploy/docker-compose.yml) | Production stack: portal, pipeline, cloudflared |
 | [infra/ansible/playbook.yml](../infra/ansible/playbook.yml) | One-time VPS provisioning |
-| [.github/workflows/ci.yml](../.github/workflows/ci.yml) | Lint/test/build on every PR and push |
+| [.claude/skills/verify/SKILL.md](../.claude/skills/verify/SKILL.md) | The verification harness: what it checks and what each failure means |
+| [scripts/verify/](../scripts/verify/) | The harness itself — seed, boot, drive, capture |
+| [testdata/lake/](../testdata/lake/) | Deterministic bronze + static GTFS fixtures the harness seeds from |
+| [.github/workflows/ci.yml](../.github/workflows/ci.yml) | Lint/test/build/verify on every PR and push |
 | [.github/workflows/deploy.yml](../.github/workflows/deploy.yml) | Build image → push to GHCR → deploy over SSH |
 | `docs/gitops-plan.md` | The long-form deploy plan (gitignored, local only) |
-
-**Stale files:** [Makefile](../Makefile) and
-[docker-compose.dev.yml](../docker-compose.dev.yml) come from rev1 (Python,
-Postgres, Metabase). They point at a root `docker-compose.yml` and a `pipeline/`
-Python package, and neither exists anymore. Don't use them to run this code.
 
 ---
 
@@ -96,9 +96,16 @@ later cycle never sees a half-written file.
 ### Running modes
 
 ```
-pipeline          # serve: run a cycle now, then on every INGEST_INTERVAL boundary
-pipeline -once    # one cycle, exit non-zero if any feed failed (backfill/testing)
+pipeline           # serve: run a cycle now, then on every INGEST_INTERVAL boundary
+pipeline -once     # one cycle, exit non-zero if any feed failed (backfill/testing)
+pipeline -rebuild  # re-derive bronze and gold from existing raw, then exit
 ```
+
+`-rebuild` skips `ingestAll` and `prune`, so it needs no network and cannot
+delete anything. It is how you repair a day whose last cycle failed (delete
+that partition's Parquet and re-run), and it is what the verify harness uses to
+build gold from committed fixtures through the real transform rather than a
+hand-written copy of the schema.
 
 In production it runs as a long-lived compose service and keeps its own
 schedule. Nothing external triggers it. GitHub Actions cron was rejected
@@ -135,11 +142,9 @@ agency, feed name, byte count, and destination path; failures include the
 feed and error; and the final `cycle ok`, `cycle finished with failures`, or
 `cycle interrupted` record includes total elapsed milliseconds. This makes
 fetch failures and end-to-end cycle time measurable without parsing the lake.
-Stage-level timings are intentionally not yet exposed: the pipeline and portal
-refactor currently changes the stage functions, so adding instrumentation there
-would overlap that work. The safe current boundary is the cycle timer; a future
-stage result can add `ingest_ms`, `bronze_ms`, `gold_ms`, and `prune_ms` while
-preserving the same structured fields.
+Stage-level timings are not exposed yet. The current boundary is the cycle
+timer; a future stage result can add `ingest_ms`, `bronze_ms`, `gold_ms` and
+`prune_ms` while preserving the same structured fields.
 
 The performance model is deliberately asymmetric. Network fetches are
 parallelized with a fixed four-worker pool, while bronze and gold remain
@@ -284,17 +289,44 @@ deleted. `gold/` is never touched.
 | `GET /` | SQL viewer (`index.html`, embedded) | `no-cache` |
 | `GET /board` | Departure board (`board.html`, embedded) | `no-cache` |
 | `GET /maps` | World and city train maps (`maps.html`, embedded) | `no-cache` |
-| `GET /chandb.<hash>.js` | Shared JS module | `max-age=1y, immutable` |
-| `GET /chandb.js` | Same file without the hash, for pages cached from an older deploy | `no-cache` |
+| `GET /<name>.<hash>.js` | A JS module: `chandb`, `index`, `board` or `maps` | `max-age=1y, immutable` |
+| `GET /<name>.js` | Same bytes without the hash, for pages cached from an older deploy | `no-cache` |
+| `GET /portal.css` | The single stylesheet | `no-cache` |
 | `GET /api/datasets` | Lists gold Parquet files, grouped as `<agency>_<table>` | 60 s |
 | `GET /data/…` | `http.FileServer` over **`/lake/gold` only** | 60 s for today's partition, 1 day + immutable for past ones |
 | `GET /healthz` | Returns `ok` | `no-store` |
 
-The four frontend files are compiled into the binary with `//go:embed`.
-`buildAssets()` hashes `chandb.js` and rewrites the `/chandb.js` references in
-both pages to the hashed URL. This prevents a bug where a browser pairs a fresh
-page with a stale cached module. The mismatch fails as a parse-time
-SyntaxError, and the page hangs silently.
+Every frontend file is compiled into the binary with `//go:embed`.
+`buildAssets()` content-hashes each JS module and rewrites the references to
+it. This prevents a bug where a browser pairs a fresh page with a stale cached
+module: the mismatch fails as a parse-time SyntaxError, so no handler runs and
+the page hangs silently on its first status line.
+
+The order inside `buildAssets` is load-bearing. `chandb.js` is hashed first
+because the three page modules import it, so their bodies — and therefore their
+own hashes — depend on its hashed path. The result is two levels of
+indirection: a page loads `/index.<hash>.js`, and *that* module imports
+`/chandb.<hash>.js`.
+
+`buildAssets` returns an `assets` value rather than writing package globals.
+The routes depend on it (`hashedPath` is half of a mux pattern), so passing it
+to `portalRoutes` makes that ordering a compile-time fact instead of an
+init-order trap.
+
+### Styling
+
+There is one stylesheet, `portal.css`. It holds the design tokens in `:root`
+and all the shared chrome — header, nav, `main`, `.intro`, `#status`, buttons,
+inputs, tables. Each page's `<style>` block holds only layout that is genuinely
+its own, and the `<link>` comes **first** so those page rules override the
+shared sheet rather than fighting it.
+
+This used to be two competing systems: the pages referenced `--fg`, `--muted`,
+`--panel`, `--panel-2` and `--focus`, which no file defined, while `portal.css`
+shipped a different vocabulary (`--ink`, `--bg-sink`, …). An unresolved `var()`
+drops its whole declaration, so those rules silently did nothing. The verify
+harness now resolves every `var(--x)` against the `:root` definitions and fails
+if any is undefined.
 
 `http.FileServer` supports HTTP Range requests natively, and the browser-side
 engine depends on that. `http.Dir` rejects `..`, so a request can't reach
@@ -395,6 +427,11 @@ Runs on every PR and every push to `main`:
 
 - `go vet`, `go build` and `go test -race`;
 - `golangci-lint`;
+- the **verify harness** in headless chromium, uploading its screenshots,
+  console log and trace as artifacts (on failure especially). An exit 2 —
+  INFRA_FAIL, meaning the jsDelivr CDN or chromium itself was the problem —
+  annotates a warning instead of failing the job, so a CDN blip cannot block a
+  merge;
 - a Docker build with no push;
 - `ansible-lint` on the playbook.
 
@@ -448,18 +485,55 @@ The playbook:
 
 ## Working on it locally
 
+`make help` lists every target. The short version:
+
 ```
-go test -race ./...                      # everything is unit tested
+make setup          # one time: Playwright + chromium (~150MB)
+make verify         # seed, boot, drive all three pages, write a PASS/FAIL report
+make test           # go test -race ./...
+make dev-pipeline   # one real fetch + all transforms into .verify/lake
+make dev-portal     # serve that lake on :8080
+```
+
+Or by hand, against any lake you like:
+
+```
+go test -race ./...
 mkdir -p /tmp/lake
 LAKE_DIR=/tmp/lake go run ./cmd/pipeline -once     # real fetch + all transforms
 LAKE_DIR=/tmp/lake PORTAL_ADDR=:8080 go run ./cmd/portal
-# open http://localhost:8080 and http://localhost:8080/board
+# open http://localhost:8080, /board and /maps
 ```
 
 The pipeline needs a C toolchain because DuckDB uses cgo. Without
 `SECRETS_DIR/511_api_key`, the BART vehicle-positions feed is skipped.
 
-The tests cover the invariants the comments describe:
+### Verifying a change
+
+`go test` covers the server. It cannot tell you whether the *page* works,
+because the query engine runs in the visitor's browser — a green test suite is
+compatible with all four maps rendering blank. `make verify` closes that gap:
+
+1. **Seed.** `.verify/lake/` is rebuilt from scratch from the fixtures in
+   `testdata/lake/`, with timestamps stamped relative to now (`/board` treats
+   `max(last_seen)` as "now"; a frozen fixture renders an empty page). Gold is
+   then built by the real `pipeline -rebuild`, never hand-written, so the
+   fixture cannot drift from `gold.go`.
+2. **Exercise.** The go suite, then live HTTP checks (Range → 206, traversal →
+   404, cache headers), then headless chromium actually driving `/`, `/board`
+   and `/maps` — running an example query, clicking filters, and reading pixels
+   back off each map canvas.
+3. **Capture.** Screenshots, console log, network failures, a Playwright trace
+   and a PASS/FAIL table land in `.verify/run-<timestamp>/`, symlinked as
+   `.verify/latest/`.
+4. **Verdict.** Exit **0** pass, **1** the code is broken, **2** blocked by
+   infrastructure (CDN unreachable, port taken, chromium missing) — which is
+   explicitly *not* a code failure and is only a warning in CI.
+
+[.claude/skills/verify/SKILL.md](../.claude/skills/verify/SKILL.md) documents
+every check, its threshold, and where to look first when it fails.
+
+The unit tests cover the invariants the comments describe:
 
 - Hive paths and UTC normalisation;
 - atomic writes that leave no partial files;
@@ -467,7 +541,8 @@ The tests cover the invariants the comments describe:
 - zip-slip, and skipping incomplete static snapshots;
 - `dtPartition` rejecting SQL injection;
 - retention that never touches gold;
-- Range requests, `..` traversal, and the content-hash caching scheme.
+- Range requests, `..` traversal, and the content-hash caching scheme,
+  including that editing `chandb.js` moves every dependent module's URL.
 
 ### Adding things
 
@@ -493,10 +568,10 @@ The tests cover the invariants the comments describe:
   stop and time columns, and the board skips them. To fix this, join
   `stop_times.txt` (2.7 MB for rail) on `(trip_id, stop_sequence)` and apply
   the delay to scheduled times.
-- **A failed last cycle of the day is never rebuilt.** Once a day is in the
-  past, its gold file counts as final. If the 23:30 UTC cycle failed, that day
-  is missing those snapshots until someone deletes the Parquet file and lets
-  the pipeline rebuild it (raw is still there for 14 days).
+- **A failed last cycle of the day is never rebuilt automatically.** Once a day
+  is in the past, its gold file counts as final. If the 23:30 UTC cycle failed,
+  that day is missing those snapshots until someone deletes the Parquet file
+  and re-runs `pipeline -rebuild` (raw is still there for 14 days).
 - **Static zips are re-extracted every cycle.** In `transformBronze`, the zip
   branch runs before the bronze-retention check. Raw static zips from day 3 to
   day 14 get re-extracted into bronze on every cycle, and `prune` deletes them
@@ -506,5 +581,7 @@ The tests cover the invariants the comments describe:
 - **Some code comments disagree with compose.** Comments in `gold.go` describe
   a 512 MB container and a 48 MB tmpfs. Compose sets `mem_limit: 1g` and a 64 MB
   `/tmp`. The DuckDB limit is 512 MB either way.
-- **The Makefile and `docker-compose.dev.yml` are from rev1** (see the
-  repository map).
+- **BART has no vehicle positions, so the Bay Area map is always empty.** The
+  page says "No positions published" and the verify harness reports `maps.bay`
+  as a WARN rather than a failure. Wiring up the 511 feed (already reaching
+  bronze) to a `bart/vehicle_positions` gold table would fill it in.

@@ -4,23 +4,23 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>chandb — train maps</title>
+<link rel="stylesheet" href="/portal.css">
 <style>
+  /* Page-specific layout only. The shared chrome — header, nav, main, .intro,
+     #status — lives in portal.css, which loads first so these rules can
+     override it rather than fight it. */
   .maps { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:1rem; }
-  .head { display:flex; justify-content:space-between; gap:1.5rem; }
-  .map-card { overflow:hidden; }
   .map-head { padding:0.8rem 1rem; display:flex; justify-content:space-between; gap:1rem; align-items:baseline; }
   .map-head h3 { margin:0; font-size:0.9rem; }
-  .count { font:0.68rem var(--mono); }
-  .map { position:relative; height:360px; overflow:hidden; background:var(--bg-raise); }
+  .count { font-size:0.68rem; }
+  .map { position:relative; height:360px; overflow:hidden; }
   .map canvas { display:block; width:100%; height:100%; }
   .map-note { padding:0.55rem 1rem; font-size:0.68rem; }
   @media (max-width:700px) {
-    .head { display:block; }
     .maps { grid-template-columns:1fr; }
     .map { height:320px; }
   }
 </style>
-<link rel="stylesheet" href="/portal.css">
 </head>
 <body>
 <header><div class="head"><div><h1>chandb</h1><div class="sub">Train activity across the latest 24 hours of snapshots.</div></div>
@@ -36,126 +36,6 @@
     <article class="map-card"><div class="map-head"><h3>Philadelphia</h3><span class="count" id="count-philadelphia">Loading…</span></div><div class="map" id="map-philadelphia"></div><div class="map-note">SEPTA city and Regional Rail · latest 24 hours.</div></article>
   </section>
 </main>
-<script type="module">
-import { boot, columnsOf, rowsOf, fmtMB } from '/chandb.js';
-
-const $ = id => document.getElementById(id);
-const status = $('status');
-const say = (text, error = false) => {
-  status.textContent = text;
-  status.classList.toggle('err', error);
-  status.setAttribute('aria-busy', error ? 'false' : 'true');
-};
-const configs = [
-  { id: 'world', bounds: [-180, 180, -60, 75], agencies: null },
-  { id: 'boston', bounds: [-72.5, -70.5, 41.5, 43], agencies: ['mbta'] },
-  { id: 'bay', bounds: [-123, -121, 37, 39], agencies: ['bart'] },
-  { id: 'philadelphia', bounds: [-76, -74.5, 39.3, 40.5], agencies: ['septa', 'septarail'] },
-];
-
-function makeMap(config) {
-  const host = document.getElementById(`map-${config.id}`);
-  const canvas = document.createElement('canvas');
-  host.replaceChildren(canvas);
-  return { canvas, bounds: config.bounds };
-}
-
-function heatColor(ratio) {
-  return `hsl(${190 + Math.round(ratio * 140)} 88% 64%)`;
-}
-
-function addActivity(config, map, rows) {
-  const selected = config.agencies ? rows.filter(row => config.agencies.includes(row.agency)) : rows;
-  const bounds = config.bounds;
-  const max = Math.max(...selected.map(row => Number(row.observations)), 1);
-  const ctx = map.canvas.getContext('2d');
-  const width = map.canvas.clientWidth, height = map.canvas.clientHeight;
-  const scale = window.devicePixelRatio || 1;
-  map.canvas.width = width * scale;
-  map.canvas.height = height * scale;
-  ctx.scale(scale, scale);
-  ctx.fillStyle = '#101014';
-  ctx.fillRect(0, 0, width, height);
-
-  const project = (lon, lat) => [
-    ((lon - bounds[0]) / (bounds[1] - bounds[0])) * width,
-    ((bounds[3] - lat) / (bounds[3] - bounds[2])) * height,
-  ];
-  ctx.strokeStyle = '#22222a';
-  ctx.lineWidth = 1;
-  ctx.font = '10px ui-monospace, monospace';
-  ctx.fillStyle = '#52677a';
-  const lonStep = bounds[1] - bounds[0] > 100 ? 60 : 0.5;
-  const latStep = bounds[1] - bounds[0] > 100 ? 30 : 0.5;
-  for (let lon = Math.ceil(bounds[0] / lonStep) * lonStep; lon <= bounds[1]; lon += lonStep) {
-    const [x] = project(lon, bounds[2]);
-    ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, height); ctx.stroke();
-    ctx.fillText(`${lon}°`, x + 5, height - 8);
-  }
-  for (let lat = Math.ceil(bounds[2] / latStep) * latStep; lat <= bounds[3]; lat += latStep) {
-    const [, y] = project(bounds[0], lat);
-    ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(width, y); ctx.stroke();
-    ctx.fillText(`${lat}°`, 6, Math.max(12, y - 5));
-  }
-  ctx.strokeStyle = '#4ad5ff';
-  ctx.strokeRect(0.5, 0.5, width - 1, height - 1);
-
-  for (const row of selected) {
-    const lat = Number(row.latitude), lon = Number(row.longitude);
-    if (!Number.isFinite(lat) || !Number.isFinite(lon)) continue;
-    const ratio = Math.sqrt(Number(row.observations) / max);
-    const [x, y] = project(lon, lat);
-    if (x < 0 || x > width || y < 0 || y > height) continue;
-    const radius = 3 + ratio * 12;
-    const color = heatColor(ratio);
-    const glow = ctx.createRadialGradient(x, y, 0, x, y, radius * 2.8);
-    glow.addColorStop(0, `${color}cc`);
-    glow.addColorStop(1, `${color}00`);
-    ctx.fillStyle = glow;
-    ctx.beginPath(); ctx.arc(x, y, radius * 2.8, 0, Math.PI * 2); ctx.fill();
-    ctx.fillStyle = color;
-    ctx.beginPath(); ctx.arc(x, y, radius, 0, Math.PI * 2); ctx.fill();
-  }
-  $(`count-${config.id}`).textContent = selected.length
-    ? `${selected.length.toLocaleString()} activity cells`
-    : 'No positions published';
-}
-
-async function run() {
-  try {
-    const result = await boot((loaded, total) => {
-      if (total > 0) say(`Loading query engine… ${Math.round(loaded / total * 100)}%`);
-      else if (loaded < 0) say('Query engine ready; registering datasets…');
-    });
-    const tables = [];
-    for (const table of result.available) {
-      if (!table.endsWith('_vehicle_positions')) continue;
-      const cols = await columnsOf(result.conn, table);
-      if (['agency', 'latitude', 'longitude', 'feed_timestamp'].every(c => cols.has(c))) {
-        tables.push(table);
-      }
-    }
-    if (!tables.length) throw new Error('No vehicle-position datasets are published yet');
-    const sql = tables.map(table => `
-      SELECT agency,
-             floor(latitude * 100) / 100 AS latitude,
-             floor(longitude * 100) / 100 AS longitude,
-             count(*) AS observations
-      FROM ${table}
-      WHERE feed_timestamp >= (SELECT max(feed_timestamp) FROM ${table}) - 86400
-      GROUP BY agency, latitude, longitude
-    `).join(' UNION ALL ');
-    const rows = rowsOf(await result.conn.query(sql));
-    const maps = new Map(configs.map(config => [config.id, { config, map: makeMap(config) }]));
-    for (const entry of maps.values()) addActivity(entry.config, entry.map, rows);
-    say(`Ready · ${rows.length.toLocaleString()} activity cells · latest 24 hours · ${fmtMB(result.bytes)} MB`);
-    status.setAttribute('aria-busy', 'false');
-  } catch (error) {
-    say(`Unable to load train positions: ${error.message}`, true);
-    for (const config of configs) $(`count-${config.id}`).textContent = 'Unavailable';
-  }
-}
-run();
-</script>
+<script type="module" src="/maps.js"></script>
 </body>
 </html>

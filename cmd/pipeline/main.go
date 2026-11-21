@@ -7,6 +7,7 @@
 //
 //	pipeline           # serve: fetch every INGEST_INTERVAL, forever
 //	pipeline -once     # single cycle, exit non-zero if any feed failed
+//	pipeline -rebuild  # re-derive bronze and gold from disk, no network
 //
 // Raw means raw: each feed's response body is written to disk byte-for-byte,
 // unparsed. GTFS-RT is protobuf, and the bytes carry their own header
@@ -27,6 +28,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"net/http"
 	"os"
@@ -183,7 +185,17 @@ const ingestWorkers = 4
 func main() {
 	once := flag.Bool("once", false,
 		"run a single ingest cycle and exit instead of serving")
+	rebuild := flag.Bool("rebuild", false,
+		"re-derive bronze and gold from what is already in LAKE_DIR, then exit")
 	flag.Parse()
+
+	if *rebuild {
+		if err := runRebuild(); err != nil {
+			slog.Error("rebuild failed", "err", err)
+			os.Exit(1)
+		}
+		return
+	}
 
 	if *once {
 		if err := runOnce(); err != nil {
@@ -320,6 +332,69 @@ func runOnce() error {
 			len(failed), strings.Join(failed, ", "))
 	}
 	return nil
+}
+
+// runRebuild re-derives the lake from what is already on disk: transforms
+// only, no fetch and no prune.
+//
+// It exists so a hand-assembled lake can be turned into gold by the real
+// transform. The alternative — writing Parquet by hand to test against — means
+// a second copy of the gold schema that drifts the moment gold.go changes, and
+// then the thing under test and the thing doing the testing disagree without
+// anyone noticing. Here gold.go stays the only definition of a gold row.
+//
+// ingestAll is skipped because it needs the network; prune is skipped because
+// a rebuild runs against inputs someone placed deliberately, and deleting them
+// afterwards would make the second run behave differently from the first.
+func runRebuild() error {
+	lake := lakeDir()
+	if _, err := os.Stat(lake); err != nil {
+		return fmt.Errorf("stat lake dir %s: %w", lake, err)
+	}
+
+	// Same budget as the -once backfill path: a full re-derive of retained raw
+	// is minutes of DuckDB work, and the fetch timeout is the wrong scale.
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+	defer cancel()
+
+	transformBronze(ctx, lake)
+	transformGold(ctx, lake)
+
+	// transformGold logs every failure and carries on, by design — one bad
+	// agency must not stop the rest. That makes "it ran" worthless as evidence,
+	// so count the output. Empty gold after a rebuild means the bronze inputs
+	// or the gold schema moved, and failing loudly here is what makes that
+	// visible instead of producing an empty portal.
+	n, err := countGoldParquet(lake)
+	if err != nil {
+		return fmt.Errorf("count gold: %w", err)
+	}
+	if n == 0 {
+		return fmt.Errorf("rebuild produced no parquet under %s",
+			filepath.Join(lake, "gold"))
+	}
+	slog.Info("rebuild ok", "gold_files", n)
+	return nil
+}
+
+func countGoldParquet(lake string) (int, error) {
+	var n int
+	err := filepath.WalkDir(filepath.Join(lake, "gold"),
+		func(p string, d fs.DirEntry, err error) error {
+			if err != nil {
+				return err
+			}
+			if !d.IsDir() && strings.HasSuffix(p, ".parquet") {
+				n++
+			}
+			return nil
+		})
+	// No gold tree at all is a legitimate state to report, not an error to
+	// propagate: the caller's "produced nothing" check is the one that matters.
+	if errors.Is(err, fs.ErrNotExist) {
+		err = nil
+	}
+	return n, err
 }
 
 func lakeDir() string {

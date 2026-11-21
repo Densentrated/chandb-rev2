@@ -1,0 +1,20 @@
+{
+  "name": "chandb-rev2-verify",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Browser-tier tooling for the verify harness. The app itself ships no JavaScript build — cmd/portal embeds its pages with //go:embed and DuckDB-WASM is loaded from jsDelivr at runtime. Playwright is here only so scripts/verify can drive those pages like a user.",
+  "scripts": {
+    "verify": "scripts/verify/run.sh",
+    "verify:seed": "scripts/verify/seed-lake.sh",
+    "verify:portal": "scripts/verify/start-portal.sh",
+    "verify:stop": "scripts/verify/stop-portal.sh",
+    "verify:static": "node scripts/verify/static-checks.mjs",
+    "verify:http": "scripts/verify/http-checks.sh",
+    "verify:browser": "node scripts/verify/drive.mjs",
+    "setup": "npm install && npx playwright install chromium"
+  },
+  "devDependencies": {
+    "playwright": "^1.56.0"
+  }
+}

@@ -1,0 +1,4 @@
+route_id,route_short_name,route_long_name,route_type,route_color
+PAO,PAO,Paoli/Thorndale Line,2,963732
+TRE,TRE,Trenton Line,2,1B5E20
+AIR,AIR,Airport Line,2,00558B

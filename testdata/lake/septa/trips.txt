@@ -1,0 +1,7 @@
+trip_id,route_id,trip_headsign
+septa-mfl-11,MFL,Frankford Transportation Center
+septa-mfl-12,MFL,69th Street Transportation Center
+septa-bsl-21,BSL,Fern Rock Transportation Center
+septa-bsl-22,BSL,NRG Station
+septa-10-31,10,13th Street
+septa-17-41,17,Pennsport

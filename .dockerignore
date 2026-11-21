@@ -9,18 +9,21 @@
 .gitignore
 .github
 
-# Local Python leftovers from rev1
-.venv
-.ruff_cache
-__pycache__
-*.pyc
-
-# Infra and docs are not build inputs
+# Infra, docs and tooling are not build inputs
 infra
 docs
 deploy
 Makefile
-docker-compose.dev.yml
+
+# The verify harness: Playwright, its fixtures and its generated lake. None of
+# it is compiled into either binary, and .verify/ in particular can be large.
+.claude
+scripts
+testdata
+node_modules
+package.json
+package-lock.json
+.verify
 
 # Never build-context a secret or a data file
 .env

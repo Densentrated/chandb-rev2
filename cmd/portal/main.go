@@ -59,38 +59,93 @@ var boardHTML []byte
 //go:embed maps.html
 var mapsHTML []byte
 
-// Shared browser runtime. Both pages import it, so the DuckDB-WASM setup and
+// Shared browser runtime. Every page imports it, so the DuckDB-WASM setup and
 // dataset registration exist once rather than per page.
 //
 //go:embed chandb.js
 var chandbJS []byte
 
+// One module per page. These used to be inline <script type="module"> blocks,
+// which meant ~700 lines of JS that no linter, parser or test ever saw.
+//
+//go:embed index.js
+var indexJS []byte
+
+//go:embed board.js
+var boardJS []byte
+
+//go:embed maps.js
+var mapsJS []byte
+
 //go:embed portal.css
 var portalCSS []byte
 
-// Content-hashed asset URL, e.g. /chandb.3f9a1c2b4d5e.js
+const jsType = "text/javascript; charset=utf-8"
+
+// module is one JS file served at two URLs: a content-hashed one that can be
+// cached forever, and its plain name as a fallback.
+type module struct {
+	path       string // "/chandb.js"
+	hashedPath string // "/chandb.3f9a1c2b4d5e.js"
+	body       []byte
+}
+
+// assets is every byte this process serves, built once at startup.
 //
-// The pages and the module they import are separate HTTP responses with
+// It is a value rather than a set of package globals because the routes depend
+// on it: hashedPath is half of a mux pattern, so a handler registered before
+// the hash is computed silently listens on "/chandb..js". Passing the struct
+// in makes that ordering a compile-time fact instead of an init-order trap.
+type assets struct {
+	modules []module
+	pages   map[string][]byte // route -> HTML with every module reference rewritten
+	css     []byte
+}
+
+// buildAssets content-hashes every module and rewrites the references to them.
+//
+// The pages and the modules they import are separate HTTP responses with
 // separate cache lifetimes. A browser holding a stale chandb.js while fetching
 // a fresh page gets an import/export mismatch — which fails as a SyntaxError
 // at PARSE time, so no handler runs and the page hangs on its initial text
 // with nothing logged. Hashing the URL makes that impossible: new content is a
 // new URL, and the stale copy is simply never requested again.
-var (
-	hashedJSPath string
-	indexPage    []byte
-	boardPage    []byte
-	mapsPage     []byte
-)
+//
+// Order is load-bearing. chandb.js is hashed first because the page modules
+// import it, so their bodies — and therefore their own hashes — depend on its
+// hashed path. Hashing a page module before rewriting its import would pin a
+// URL that no longer matches its contents.
+func buildAssets() assets {
+	hash := func(name string, body []byte) module {
+		sum := sha256.Sum256(body)
+		stem := strings.TrimSuffix(name, ".js")
+		return module{
+			path:       "/" + name,
+			hashedPath: "/" + stem + "." + hex.EncodeToString(sum[:])[:12] + ".js",
+			body:       body,
+		}
+	}
+	rewrite := func(body []byte, mods ...module) []byte {
+		for _, m := range mods {
+			body = bytes.ReplaceAll(body, []byte(m.path), []byte(m.hashedPath))
+		}
+		return body
+	}
 
-func buildAssets() {
-	sum := sha256.Sum256(chandbJS)
-	hashedJSPath = "/chandb." + hex.EncodeToString(sum[:])[:12] + ".js"
+	shared := hash("chandb.js", chandbJS)
+	index := hash("index.js", rewrite(indexJS, shared))
+	board := hash("board.js", rewrite(boardJS, shared))
+	maps := hash("maps.js", rewrite(mapsJS, shared))
 
-	ref := []byte("/chandb.js")
-	indexPage = bytes.ReplaceAll(indexHTML, ref, []byte(hashedJSPath))
-	boardPage = bytes.ReplaceAll(boardHTML, ref, []byte(hashedJSPath))
-	mapsPage = bytes.ReplaceAll(mapsHTML, ref, []byte(hashedJSPath))
+	return assets{
+		modules: []module{shared, index, board, maps},
+		pages: map[string][]byte{
+			"/":      rewrite(indexHTML, shared, index),
+			"/board": rewrite(boardHTML, shared, board),
+			"/maps":  rewrite(mapsHTML, shared, maps),
+		},
+		css: portalCSS,
+	}
 }
 
 func main() {
@@ -157,11 +212,7 @@ func runHealthcheck() int {
 func run() error {
 	goldDir := path.Join(lakeDir(), "gold")
 
-	buildAssets()
-
-	const jsType = "text/javascript; charset=utf-8"
-
-	mux := portalRoutes(goldDir, jsType)
+	mux := portalRoutes(buildAssets(), goldDir)
 
 	srv := &http.Server{
 		Addr:    listenAddr(),
@@ -202,17 +253,29 @@ func run() error {
 	}
 }
 
-func portalRoutes(goldDir, jsType string) *http.ServeMux {
+func portalRoutes(a assets, goldDir string) *http.ServeMux {
+	const htmlType = "text/html; charset=utf-8"
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", handleHealthz)
-	mux.HandleFunc("GET /board", servePage(boardPage, "text/html; charset=utf-8"))
-	mux.HandleFunc("GET /maps", servePage(mapsPage, "text/html; charset=utf-8"))
-	mux.HandleFunc("GET "+hashedJSPath, serveImmutable(chandbJS, jsType))
-	mux.HandleFunc("GET /chandb.js", servePage(chandbJS, jsType))
-	mux.HandleFunc("GET /portal.css", servePage(portalCSS, "text/css; charset=utf-8"))
+
+	for _, m := range a.modules {
+		mux.HandleFunc("GET "+m.hashedPath, serveImmutable(m.body, jsType))
+		// The plain name stays routable for a browser that cached a page from
+		// an older deploy and is still asking for the unhashed URL.
+		mux.HandleFunc("GET "+m.path, servePage(m.body, jsType))
+	}
+	for route, body := range a.pages {
+		if route == "/" {
+			continue // handled below; "GET /" would match every unknown path
+		}
+		mux.HandleFunc("GET "+route, servePage(body, htmlType))
+	}
+
+	mux.HandleFunc("GET /portal.css", servePage(a.css, "text/css; charset=utf-8"))
 	mux.HandleFunc("GET /api/datasets", newCatalog(goldDir).serveHTTP)
 	mux.Handle("GET /data/", http.StripPrefix("/data/", dataServer(goldDir)))
-	mux.HandleFunc("GET /", handleIndex)
+	mux.HandleFunc("GET /", handleIndex(a.pages["/"], htmlType))
 	return mux
 }
 
@@ -243,14 +306,19 @@ func serveImmutable(body []byte, contentType string) http.HandlerFunc {
 	}
 }
 
-func handleIndex(w http.ResponseWriter, r *http.Request) {
-	if r.URL.Path != "/" {
-		http.NotFound(w, r)
-		return
+// handleIndex serves "/" and 404s everything else. "GET /" is ServeMux's
+// catch-all, so without the path check every unknown URL would render the SQL
+// viewer with a 200.
+func handleIndex(body []byte, contentType string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", contentType)
+		w.Header().Set("Cache-Control", "no-cache")
+		_, _ = w.Write(body)
 	}
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.Header().Set("Cache-Control", "no-cache")
-	_, _ = w.Write(indexPage)
 }
 
 // dataServer exposes the gold tree, and only the gold tree. http.Dir rejects
@@ -292,13 +360,14 @@ type dataset struct {
 	Bytes int64    `json:"bytes"`
 }
 
-// handleDatasets tells the browser what exists, so the page can build a view
-// over every partition without guessing at filenames.
+// catalog is one rendered /api/datasets response plus its ETag.
 type catalog struct {
 	body []byte
 	etag string
 }
 
+// catalogCache tells the browser what exists, so a page can build a view over
+// every partition without guessing at filenames.
 type catalogCache struct {
 	goldDir string
 	mu      sync.Mutex
@@ -384,8 +453,4 @@ func scanCatalog(goldDir string) (catalog, error) {
 	body = append(body, '\n')
 	sum := sha256.Sum256(body)
 	return catalog{body: body, etag: `"` + hex.EncodeToString(sum[:]) + `"`}, nil
-}
-
-func handleDatasets(goldDir string) http.HandlerFunc {
-	return newCatalog(goldDir).serveHTTP
 }
