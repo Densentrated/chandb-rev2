@@ -20,6 +20,17 @@ ENV CGO_ENABLED=1 GOOS=linux GOARCH=amd64
 RUN go build -trimpath -ldflags="-s -w" -o /out/portal   ./cmd/portal \
  && go build -trimpath -ldflags="-s -w" -o /out/pipeline ./cmd/pipeline
 
+# Bake the DuckDB extensions into the image.
+#
+# httpfs reads remote Parquet over HTTP range requests (the Ookla extract);
+# spatial reads TIGER shapefiles and does the tile-to-tract join. Both must be
+# resolved at BUILD time: the runtime container is read-only with cap_drop
+# [ALL], so `INSTALL` — which writes to the extension directory and downloads
+# executable code over the network — cannot run there, and should not.
+#
+# This adds ~108MB to the image, nearly all of it spatial's geometry libraries.
+RUN DUCKDB_EXTENSION_DIR=/out/duckdb-ext /out/pipeline -install-extensions
+
 FROM debian:bookworm-slim
 
 # Links the GHCR package to the repo, so the image shows up on the repository
@@ -39,6 +50,12 @@ RUN groupadd -g 10001 portal \
 
 COPY --from=build /out/portal   /usr/local/bin/portal
 COPY --from=build /out/pipeline /usr/local/bin/pipeline
+COPY --from=build /out/duckdb-ext /opt/duckdb-ext
+
+# Pointed at the baked directory. openDuckDB reads this and skips the SET
+# entirely when it is unset, which is what local development wants — there,
+# INSTALL works fine against a writable home.
+ENV DUCKDB_EXTENSION_DIR=/opt/duckdb-ext
 
 USER 10001:10001
 ENTRYPOINT ["/usr/local/bin/portal"]

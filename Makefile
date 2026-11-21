@@ -4,7 +4,7 @@
 # Metabase and no Python: the query engine is DuckDB-WASM in the visitor's
 # browser, and cmd/portal is a static file server. See docs/how-it-works.md.
 
-.PHONY: help verify verify-seed verify-portal verify-stop verify-static \
+.PHONY: help duckdb-ext verify verify-seed verify-portal verify-stop verify-static \
         verify-http verify-browser setup test lint ci dev-portal dev-pipeline \
         rebuild clean
 
@@ -19,8 +19,12 @@ help:          ## list targets
 # nothing about whether /maps drew anything — the engine runs in the browser.
 # Full documentation lives in .claude/skills/verify/SKILL.md.
 
-setup:         ## one-time: install Playwright and its chromium (~150MB)
+setup:         ## one-time: Playwright chromium + DuckDB extensions
 	npm install && npx playwright install chromium
+	$(MAKE) duckdb-ext
+
+duckdb-ext:    ## install httpfs + spatial locally (baked into the image in CI)
+	DUCKDB_EXTENSION_DIR=$$HOME/.duckdb/extensions go run ./cmd/pipeline -install-extensions
 
 verify:        ## seed, boot, drive all three pages, write .verify/latest/summary.md
 	scripts/verify/run.sh
