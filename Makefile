@@ -26,7 +26,7 @@ setup:         ## one-time: Playwright chromium + DuckDB extensions
 duckdb-ext:    ## install httpfs + spatial locally (baked into the image in CI)
 	DUCKDB_EXTENSION_DIR=$$HOME/.duckdb/extensions go run ./cmd/pipeline -install-extensions
 
-verify:        ## seed, boot, drive all three pages, write .verify/latest/summary.md
+verify:        ## seed, boot, drive all four pages, write .verify/latest/summary.md
 	scripts/verify/run.sh
 
 verify-seed:   ## rebuild $(LAKE) from testdata fixtures only
@@ -44,7 +44,7 @@ verify-static: ## node --check every module + resolve every CSS custom property
 verify-http:   ## go suite plus live HTTP checks against a running portal
 	scripts/verify/http-checks.sh
 
-verify-browser: ## drive /, /board and /maps in headless chromium
+verify-browser: ## drive /, /board, /maps and /broadband in headless chromium
 	RUN_DIR=.verify/scratch node scripts/verify/drive.mjs
 
 # ------------------------------------------------------------------- go basics

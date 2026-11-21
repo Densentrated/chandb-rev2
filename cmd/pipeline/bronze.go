@@ -124,6 +124,20 @@ func transformBronze(ctx context.Context, lake string) {
 			}
 			return nil
 		}
+		// Ookla arrives as Parquet already, but "already tabular" is not the
+		// same as "ready to join". Bronze is where the WKT tile polygon
+		// becomes a point and kbps becomes Mbps, so gold is a join rather
+		// than a pile of unit conversions.
+		if strings.HasSuffix(path, ".parquet") {
+			_, feedName := agencyAndFeed(lake, path)
+			if feedName == "fixed_performance" {
+				if err := normalizeOoklaTiles(ctx, lake, path); err != nil {
+					slog.Warn("ookla normalise failed", "file", path, "err", err)
+					failed++
+				}
+			}
+			return nil
+		}
 		if !strings.HasSuffix(path, ".pb") {
 			return nil
 		}

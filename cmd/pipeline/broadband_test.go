@@ -252,3 +252,51 @@ func TestTransitFeedsAreNotPacedOrDeduplicated(t *testing.T) {
 		}
 	}
 }
+
+// Retention is built for the transit feeds: ephemeral, high-frequency, fully
+// re-derived every cycle. Applying it to the broadband sources silently breaks
+// the domain — bronze vanishes after two days, the next fetch a week later is
+// deduplicated against the surviving raw and writes nothing, and the gold
+// tables freeze with no error anywhere. This asserts the exemption holds, and
+// that it has NOT been widened to cover the transit agencies.
+func TestBroadbandPartitionsSurvivePruning(t *testing.T) {
+	lake := t.TempDir()
+
+	type part struct{ layer, agency, table string }
+	parts := []part{
+		{"raw", "ookla", "fixed_performance"},
+		{"bronze", "ookla", "fixed_performance"},
+		{"raw", "census", "tiger_tracts_25"},
+		{"bronze", "census", "tiger_tracts_25"},
+		{"raw", "fcc", "bdc_availability_boston"},
+		{"raw", "mbta", "vehicle_positions"},    // must be pruned
+		{"bronze", "mbta", "vehicle_positions"}, // must be pruned
+	}
+	// Far older than any retention window.
+	old := "dt=2020-01-01"
+	for _, p := range parts {
+		dir := filepath.Join(lake, p.layer, p.agency, p.table, old)
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "snap.bin"), []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	prune(t.Context(), lake)
+
+	for _, p := range parts {
+		dir := filepath.Join(lake, p.layer, p.agency, p.table, old)
+		_, err := os.Stat(dir)
+		retained := retainedAgencies[p.agency]
+		if retained && err != nil {
+			t.Errorf("%s/%s/%s was pruned; broadband history is the product",
+				p.layer, p.agency, p.table)
+		}
+		if !retained && err == nil {
+			t.Errorf("%s/%s/%s survived pruning; transit retention must still apply",
+				p.layer, p.agency, p.table)
+		}
+	}
+}

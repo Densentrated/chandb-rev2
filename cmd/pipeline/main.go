@@ -334,6 +334,9 @@ func cycle(ctx context.Context, lake string) {
 	// and it backfills anything written before this stage existed.
 	transformBronze(ctx, lake)
 	transformGold(ctx, lake)
+	// Broadband reads the newest snapshot of each input rather than every
+	// partition, so it is a separate pass rather than more goldTables entries.
+	transformBroadbandGold(ctx, lake)
 	// Strictly after the transforms: pruning raw that has not reached gold
 	// would discard it permanently.
 	prune(ctx, lake)
@@ -408,6 +411,9 @@ func runRebuild() error {
 
 	transformBronze(ctx, lake)
 	transformGold(ctx, lake)
+	// Broadband reads the newest snapshot of each input rather than every
+	// partition, so it is a separate pass rather than more goldTables entries.
+	transformBroadbandGold(ctx, lake)
 
 	// transformGold logs every failure and carries on, by design — one bad
 	// agency must not stop the rest. That makes "it ran" worthless as evidence,

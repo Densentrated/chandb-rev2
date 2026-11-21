@@ -29,11 +29,14 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
+	"log/slog"
 	"math"
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 )
@@ -350,6 +353,302 @@ COPY (
 		return err
 	}
 	return os.Rename(tmp, out)
+}
+
+// --------------------------------------------------------- ookla to bronze
+
+// normalizeOoklaTiles turns the raw extract into joinable rows.
+//
+// Two conversions, both of which belong here rather than in gold. The tile is
+// published as a WKT polygon; what a tract join needs is a point, and taking
+// the centroid once is cheaper than taking it inside every join. And speeds
+// are published in kbps, which reads badly and invites unit mistakes three
+// layers later when someone compares them against a 100 Mbps threshold.
+func normalizeOoklaTiles(ctx context.Context, lake, rawFile string) error {
+	outDir := rawToBronzeDir(filepath.Dir(rawFile))
+	out := filepath.Join(outDir,
+		strings.TrimSuffix(filepath.Base(rawFile), ".parquet")+".parquet")
+	if _, err := os.Stat(out); err == nil {
+		return nil
+	}
+	if err := os.MkdirAll(outDir, 0o755); err != nil {
+		return err
+	}
+
+	db, err := openDuckDB(lake)
+	if err != nil {
+		return fmt.Errorf("duckdb unavailable: %w", err)
+	}
+	defer func() { _ = db.Close() }()
+	if _, err := db.ExecContext(ctx, `LOAD spatial`); err != nil {
+		return fmt.Errorf("load spatial: %w", err)
+	}
+
+	tmp := filepath.Join(outDir, ".partial-tiles.parquet")
+	defer func() { _ = os.Remove(tmp) }()
+
+	stmt := fmt.Sprintf(`
+COPY (
+  SELECT
+    quadkey,
+    ST_X(ST_Centroid(ST_GeomFromText(tile))) AS lon,
+    ST_Y(ST_Centroid(ST_GeomFromText(tile))) AS lat,
+    avg_d_kbps / 1000.0 AS down_mbps,
+    avg_u_kbps / 1000.0 AS up_mbps,
+    avg_lat_ms          AS latency_ms,
+    tests, devices,
+    src_year, src_quarter, src_quarter_start
+  FROM read_parquet('%s')
+  WHERE tests > 0
+) TO '%s' (FORMAT PARQUET, COMPRESSION ZSTD)`, rawFile, tmp)
+
+	if _, err := db.ExecContext(ctx, stmt); err != nil {
+		return fmt.Errorf("normalise %s: %w", rawFile, err)
+	}
+	if err := os.Chmod(tmp, 0o644); err != nil {
+		return err
+	}
+	return os.Rename(tmp, out)
+}
+
+func rawToBronzeDir(dir string) string {
+	sep := string(filepath.Separator)
+	return strings.Replace(dir, sep+"raw"+sep, sep+"bronze"+sep, 1)
+}
+
+// ------------------------------------------------------------ broadband gold
+
+// newestBronze returns the newest dt= partition under bronze/<agency>/<feed>
+// that contains at least one file, or "" if there is none.
+//
+// Broadband sources are snapshots of a current state, not an append-only
+// stream of observations: there is no value in rebuilding last month's view of
+// which tracts claim fiber. Gold therefore reads the newest snapshot of each
+// input rather than every partition, which is the opposite of how the transit
+// tables work and the reason this does not reuse transformGold.
+func newestBronze(lake, agency, feedName string) string {
+	root := filepath.Join(lake, "bronze", agency, feedName)
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return ""
+	}
+	var dts []string
+	for _, e := range entries {
+		if e.IsDir() && dtPartition.MatchString(e.Name()) {
+			if files, err := os.ReadDir(filepath.Join(root, e.Name())); err == nil {
+				for _, f := range files {
+					if !f.IsDir() && !strings.HasPrefix(f.Name(), ".") {
+						dts = append(dts, e.Name())
+						break
+					}
+				}
+			}
+		}
+	}
+	if len(dts) == 0 {
+		return ""
+	}
+	sort.Strings(dts)
+	return filepath.Join(root, dts[len(dts)-1])
+}
+
+// tractGlobs are every state's tract geometry, which gold unions into one
+// table. Tract GEOIDs are globally unique, so this cannot collide.
+func tractGlobs(lake string) []string {
+	var out []string
+	seen := map[string]bool{}
+	for _, r := range regions {
+		if seen[r.state] {
+			continue
+		}
+		seen[r.state] = true
+		if dir := newestBronze(lake, "census", "tiger_tracts_"+r.state); dir != "" {
+			out = append(out, filepath.Join(dir, "*.parquet"))
+		}
+	}
+	return out
+}
+
+func sqlList(items []string) string {
+	q := make([]string, len(items))
+	for i, s := range items {
+		q[i] = "'" + s + "'"
+	}
+	return "[" + strings.Join(q, ",") + "]"
+}
+
+// transformBroadbandGold builds the tract-level tables the portal reads.
+//
+// Each table is written whole on every run rather than per-partition, because
+// the inputs are snapshots and the output is small: ~2,000 tracts is a few
+// hundred kilobytes of Parquet. Partition finality, which matters a great deal
+// for the transit tables, would only cause a stale view of a current state.
+func transformBroadbandGold(ctx context.Context, lake string) {
+	tracts := tractGlobs(lake)
+	if len(tracts) == 0 {
+		slog.Debug("broadband gold skipped, no tract geometry yet")
+		return
+	}
+
+	db, err := openDuckDB(lake)
+	if err != nil {
+		slog.Warn("broadband gold skipped, duckdb unavailable", "err", err)
+		return
+	}
+	defer func() { _ = db.Close() }()
+	if _, err := db.ExecContext(ctx, `LOAD spatial`); err != nil {
+		slog.Warn("broadband gold skipped, spatial unavailable", "err", err)
+		return
+	}
+
+	// One tract table for every downstream query to join against. Geometry is
+	// parsed from WKT once here rather than per join.
+	if _, err := db.ExecContext(ctx, fmt.Sprintf(`
+CREATE OR REPLACE TEMP TABLE tracts AS
+SELECT geoid, state_fips, county_fips, tract_name,
+       land_m2, water_m2, centroid_lat, centroid_lon,
+       ST_GeomFromText(geometry_wkt) AS geom
+FROM read_parquet(%s)`, sqlList(tracts))); err != nil {
+		slog.Warn("broadband gold: tract table failed", "err", err)
+		return
+	}
+
+	var built int
+	for _, t := range broadbandTables(lake) {
+		if t.from == "" {
+			slog.Debug("broadband gold: input missing", "table", t.out)
+			continue
+		}
+		if err := writeBroadbandTable(ctx, db, lake, t); err != nil {
+			slog.Warn("broadband gold table failed", "table", t.out, "err", err)
+			continue
+		}
+		built++
+	}
+	slog.Info("broadband gold", "tables", built)
+}
+
+// broadbandTable is one gold table: where its input lives and the SQL that
+// shapes it. query receives the input glob as %s.
+type broadbandTable struct {
+	out   string
+	from  string // "" disables the table until its input exists
+	query string
+}
+
+func writeBroadbandTable(ctx context.Context, db *sql.DB, lake string, t broadbandTable) error {
+	dir := filepath.Join(lake, "gold", "broadband", t.out,
+		"dt="+time.Now().UTC().Format("2006-01-02"))
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	tmp := filepath.Join(dir, ".partial-"+t.out+".parquet")
+	defer func() { _ = os.Remove(tmp) }()
+
+	stmt := fmt.Sprintf("COPY (%s) TO '%s' (FORMAT PARQUET, COMPRESSION ZSTD)",
+		fmt.Sprintf(t.query, t.from), tmp)
+	if _, err := db.ExecContext(ctx, stmt); err != nil {
+		return err
+	}
+	if err := os.Chmod(tmp, 0o644); err != nil {
+		return err
+	}
+	return os.Rename(tmp, filepath.Join(dir, "part-0.parquet"))
+}
+
+// broadbandTables is the gold schema. Inputs that do not exist yet disable
+// their table rather than failing the run, so this is useful with only the
+// credential-free sources present.
+func broadbandTables(lake string) []broadbandTable {
+	ookla := globOf(newestBronze(lake, "ookla", "fixed_performance"))
+
+	return []broadbandTable{
+		// MEASURED. One row per tract, aggregated from the speed-test tiles
+		// whose centroid falls inside it.
+		//
+		// Tests are weighted: a tile with 400 tests is a far better estimate
+		// of that neighbourhood than one with a single test, and a plain
+		// AVG() would let one lucky gigabit test outvote a hundred slow ones.
+		// The unweighted median is kept alongside precisely so the two can be
+		// compared — a large gap between them means the tract's number rests
+		// on a handful of tiles.
+		{
+			out:  "tract_measured",
+			from: ookla,
+			query: `
+SELECT
+  t.geoid, t.state_fips, t.county_fips, t.tract_name,
+  t.centroid_lat, t.centroid_lon,
+  count(*)                                   AS tiles,
+  sum(o.tests)                               AS tests,
+  sum(o.devices)                             AS devices,
+  sum(o.down_mbps * o.tests) / sum(o.tests)  AS down_mbps_weighted,
+  sum(o.up_mbps   * o.tests) / sum(o.tests)  AS up_mbps_weighted,
+  median(o.down_mbps)                        AS down_mbps_median,
+  median(o.up_mbps)                          AS up_mbps_median,
+  min(o.down_mbps)                           AS down_mbps_min,
+  max(o.down_mbps)                           AS down_mbps_max,
+  sum(o.latency_ms * o.tests) / sum(o.tests) AS latency_ms_weighted,
+  -- The FCC's current benchmark for "broadband" is 100/20 Mbps. Share of
+  -- tiles clearing it is more honest than an average: an average hides a
+  -- tract that is half gigabit fibre and half nothing.
+  sum(CASE WHEN o.down_mbps >= 100 THEN o.tests ELSE 0 END) / sum(o.tests)
+                                             AS share_tests_over_100,
+  sum(CASE WHEN o.down_mbps >= 25 THEN o.tests ELSE 0 END) / sum(o.tests)
+                                             AS share_tests_over_25,
+  any_value(o.src_year)          AS src_year,
+  any_value(o.src_quarter)       AS src_quarter,
+  any_value(o.src_quarter_start) AS src_quarter_start
+FROM tracts t
+JOIN read_parquet(%s) o
+  ON ST_Within(ST_Point(o.lon, o.lat), t.geom)
+GROUP BY ALL`,
+		},
+
+		// COVERAGE SUMMARY. Every tract, measured or not.
+		//
+		// The LEFT JOIN is the point. A tract with no speed tests is the most
+		// interesting row in the dataset — it is either genuinely unserved or
+		// simply unmeasured, and an INNER JOIN would silently delete exactly
+		// those tracts from every chart built on this table.
+		{
+			out:  "tract_coverage",
+			from: ookla,
+			query: `
+WITH measured AS (
+  SELECT t.geoid,
+         count(*)        AS tiles,
+         sum(o.tests)    AS tests,
+         sum(o.down_mbps * o.tests) / sum(o.tests) AS down_mbps_weighted
+  FROM tracts t
+  JOIN read_parquet(%s) o
+    ON ST_Within(ST_Point(o.lon, o.lat), t.geom)
+  GROUP BY t.geoid
+)
+SELECT
+  t.geoid, t.state_fips, t.county_fips, t.tract_name,
+  t.centroid_lat, t.centroid_lon,
+  t.land_m2, t.water_m2,
+  CASE t.state_fips WHEN '25' THEN 'boston' WHEN '06' THEN 'bayarea' END AS metro,
+  coalesce(m.tiles, 0) AS tiles,
+  coalesce(m.tests, 0) AS tests,
+  m.down_mbps_weighted,
+  m.geoid IS NULL      AS unmeasured,
+  -- Tiles per square kilometre of land. A dense tract with few tiles is a
+  -- measurement gap; a sparse one with few tiles may just be empty.
+  CASE WHEN t.land_m2 > 0
+       THEN coalesce(m.tiles, 0) / (t.land_m2 / 1000000.0) END AS tiles_per_km2
+FROM tracts t
+LEFT JOIN measured m USING (geoid)`,
+		},
+	}
+}
+
+func globOf(dir string) string {
+	if dir == "" {
+		return ""
+	}
+	return "'" + filepath.Join(dir, "*.parquet") + "'"
 }
 
 // ----------------------------------------------------------- source catalog

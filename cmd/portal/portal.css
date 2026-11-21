@@ -337,6 +337,84 @@ a { color: var(--accent); }
 .delay { color: var(--accent-secondary); }
 .delay.good { color: var(--accent); }
 
+/* ---------------------------------------------------------------- broadband
+   Same split as the maps page: colour, borders and type live here, geometry
+   lives in broadband.html's own <style>.
+
+   The load-bearing rule in this block is that NOTHING standing for "no speed
+   test" borrows from the speed ramp. Missing data is always faint ink plus a
+   dashed or hollow edge — a shape rather than a value — because a reader who
+   mistakes an unmeasured tract for a slow one has drawn exactly the wrong
+   conclusion from this page. */
+
+.caveat {
+  border: 1px solid var(--accent-secondary);
+  background: var(--bg-sink);
+  color: var(--ink-dim);
+}
+.caveat h3 { color: var(--accent-secondary); }
+.caveat strong { color: var(--ink); font-weight: 400; }
+
+.panel,
+.tile { border: 1px solid var(--line); background: var(--bg-sink); }
+.panel { overflow: hidden; }
+.panel-head { border-bottom: 1px solid var(--line); }
+.panel-head h3 { color: var(--ink); font-weight: 400; letter-spacing: -0.02em; }
+.panel-note { border-top: 1px solid var(--line); color: var(--ink-dim); }
+.panel-note strong { color: var(--ink); font-weight: 400; }
+
+.tile .n { color: var(--accent); }
+.tile .k { color: var(--ink-faint); }
+.tile .note { color: var(--ink-dim); }
+
+/* The unmeasured tile is deliberately off the accent entirely. */
+.tile.nodata { border-style: dashed; border-color: var(--ink-faint); }
+.tile.nodata .n { color: var(--ink-dim); }
+
+.control-label { color: var(--ink-faint); }
+.control button.on {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.chart,
+.tmap { background: var(--bg-raise); }
+
+/* Evidence tiers as fill weight: solid, half-strength, then hatched. The hatch
+   is the signal that matters — a bar segment you can see through is a count of
+   tracts whose figure rests on very few tests. */
+.bar-track { background: var(--bg-raise); }
+.seg.strong { background: var(--accent); }
+.seg.moderate { background: color-mix(in srgb, var(--accent) 45%, var(--bg-raise)); }
+.seg.thin {
+  box-shadow: inset 0 0 0 1px var(--ink-faint);
+  background: repeating-linear-gradient(
+    45deg,
+    var(--ink-faint) 0 2px,
+    transparent 2px 5px
+  );
+}
+/* Matches the hollow ring the tract maps draw in --ink-dim. */
+.nodata-swatch { border: 1px dashed var(--ink-dim); }
+.dist-row .label { color: var(--ink-dim); }
+.dist-row .label.dist-bench { color: var(--accent-secondary); }
+.dist-row .n { color: var(--ink); }
+
+.nodata-row { border: 1px dashed var(--ink-faint); color: var(--ink-dim); }
+
+.tier { border: 1px solid var(--line); color: var(--ink-faint); }
+.tier.strong { border-color: var(--accent); color: var(--accent); }
+.tier.moderate { color: var(--ink-dim); }
+.tier.thin { border-style: dashed; border-color: var(--ink-faint); color: var(--ink-faint); }
+.tier.none { border-style: dashed; border-color: var(--ink-faint); color: var(--ink-faint); }
+
+/* A thin-evidence tract stays in the ranking but never reads as equal to the
+   rows around it. */
+tr.thin td { color: var(--ink-faint); }
+
+.unmeasured-list { color: var(--ink-dim); }
+
 @media (max-width: 700px) {
   header { padding: 0 var(--pad); }
   .head { display: block; padding: 0; }

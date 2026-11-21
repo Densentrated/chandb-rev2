@@ -69,6 +69,26 @@ func prune(ctx context.Context, lake string) {
 	}
 }
 
+// retainedAgencies are never pruned from raw or bronze, at any age.
+//
+// The retention model above is built for the transit feeds: high-frequency,
+// ephemeral, and fully re-derivable into gold within one cycle, so raw is a
+// 14-day replay buffer and bronze a 2-day scratch layer.
+//
+// The broadband sources are the opposite on every axis. They publish quarterly
+// or twice a year, they are small (a whole Ookla extract is ~1MB, tract
+// geometry ~4MB), and the entire point of the domain is change over time — so
+// history IS the product rather than a buffer. Pruning them also breaks the
+// pipeline outright: bronze would vanish after two days, the next fetch seven
+// days later would be deduplicated against the still-present raw and write
+// nothing, and transformBroadbandGold would find no input and skip silently.
+// Gold would sit frozen with no error anywhere.
+var retainedAgencies = map[string]bool{
+	"ookla":  true,
+	"census": true,
+	"fcc":    true,
+}
+
 // pruneLayer walks <layer>/<agency>/<table>/dt=... and removes expired
 // partitions. Only directories matching the dt= pattern exactly are considered,
 // so an unexpected directory is left alone rather than deleted.
@@ -80,6 +100,9 @@ func pruneLayer(ctx context.Context, root string, cutoff time.Time) (removed int
 
 	for _, agency := range agencies {
 		if !agency.IsDir() {
+			continue
+		}
+		if retainedAgencies[agency.Name()] {
 			continue
 		}
 		tables, err := os.ReadDir(filepath.Join(root, agency.Name()))

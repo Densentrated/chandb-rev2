@@ -2,8 +2,8 @@
 name: verify
 description: >-
   Run the chandb-rev2 verification harness end to end: seed a deterministic
-  lake, start the portal, and drive /, /board and /maps in a real browser while
-  capturing screenshots, console output, network failures and a Playwright
+  lake, start the portal, and drive /, /board, /maps and /broadband in a real
+  browser while capturing screenshots, console output, network failures and a Playwright
   trace. Use when asked to "verify", "run verify", "check the app works", "did
   my change break the frontend", "run the verification loop", "make sure the
   portal still renders", or before handing off any change to cmd/portal,
@@ -97,8 +97,8 @@ cache headers (`immutable` on the hashed module URL, `no-cache` on everything
 else).
 
 **Browser** (`drive.mjs`, Playwright, headless chromium, 1440x900): one browser
-context for all three pages so the ~34MB DuckDB-WASM bundle downloads once per
-run rather than three times.
+context for all four pages so the ~34MB DuckDB-WASM bundle downloads once per
+run rather than four times.
 
 - `/` — wait for the status bar to leave its busy state, click the
   *"Which trains were late?"* example, assert ≥1 data row, then toggle the
@@ -113,6 +113,16 @@ run rather than three times.
   canvas: *painted* (anything that is not the `#101014` background) and *heat*
   (vivid pixels from the `hsl(190..330 88% 64%)` palette, which excludes the
   graticule and its labels). Zero painted is a blank canvas and a hard fail.
+- `/broadband` — assert the ledger adds up (measured + unmeasured = every
+  tract), that the distribution draws binned bars and keeps unmeasured tracts
+  off the speed axis, and then read `getImageData` from `#chart-evidence`,
+  `#tracts-boston` and `#tracts-bayarea`. The pixel classes are the point:
+  saturated ramp colours mean a plotted tract, `--ink-dim` (`#91a6b8`) means a
+  "no test" ring, and everything darker is graticule. A map that reported
+  unmeasured tracts and drew no rings is a hard fail — that is the page
+  silently collapsing "unmeasured" into "slow". Finally, assert no unmeasured
+  tract reached the speed ranking, and that the evidence floor changes the
+  caption's eligible total and restores it.
 - Throughout: every `console` message, every `pageerror`, every failed or
   4xx/5xx request.
 
@@ -135,7 +145,7 @@ symlinked at it:
 ```
 summary.md          PASS/FAIL/WARN table, one row per check, each naming its artifact
 checks.tsv          the raw rows summary.md is built from
-screenshots/{index,board,maps}.png
+screenshots/{index,board,maps,broadband}.png
 console.json        every console message and pageerror, tagged by page
 network.json        every failed or 4xx/5xx request, tagged by page
 trace.zip           npx playwright show-trace .verify/latest/trace.zip
@@ -169,6 +179,9 @@ portal.log          the portal process output for this run
 - the `/` example query returning 0 rows
 - `/board` rendering 0 stations
 - any `/maps` canvas fully blank
+- a `/broadband` canvas that is blank, plots no tract, or draws no "no test"
+  ring while the page reports unmeasured tracts
+- an unmeasured tract appearing in `/broadband`'s speed ranking
 - a Range request that is not 206 (or not exactly 100 bytes, or with a wrong
   `Content-Range`)
 - a traversal attempt that does not end in 404
@@ -204,6 +217,13 @@ justify a retry loop — apply the remedy or report the block.
 | `board.stations` | `agencySQL` in `cmd/portal/board.js` — "now" is `max(last_seen)`, window −10min..+60min; re-seed if the fixture aged out |
 | `board.filters` | `renderAgencyFilter` / `renderTypeFilter` / `render()` in `cmd/portal/board.js` |
 | `maps.*` | `addActivity` in `cmd/portal/maps.js` — projection bounds, `heatColor` and the heat loop |
+| `broadband.ready` | the `run()` catch in `cmd/portal/broadband.js`, then `console.json`; a missing `broadband_tract_coverage` reports itself here |
+| `broadband.ledger` | `renderLedger` in `cmd/portal/broadband.js`, and the `unmeasured` flag in `broadbandTables` (`cmd/pipeline/broadband.go`) — measured + unmeasured must equal every tract |
+| `broadband.distribution` | `renderDistribution` in `cmd/portal/broadband.js` — `BINS`, the per-tier split, and the detached `#dist-unmeasured` note that keeps unmeasured tracts off the speed axis |
+| `broadband.evidence` | `drawEvidenceChart` in `cmd/portal/broadband.js` — the log-x domain guard, `niceMax`, and the rule that only the speed ramp may be saturated |
+| `broadband.tracts` | `drawTractMap` in `cmd/portal/broadband.js` — the `INK` invariant (ramp = measured, `--ink-dim` = no test), the projection pad for zero-span centroids, and whether `centroid_lat`/`centroid_lon` reached gold |
+| `broadband.unmeasured` | `renderTable` / `renderUnmeasured` in `cmd/portal/broadband.js` — unmeasured tracts are listed on their own and must never enter the ranking |
+| `broadband.filters` | `renderEvidenceFilter` / `renderTable` in `cmd/portal/broadband.js` — the check reads the caption's "of N measured" total, not the 60-row render cap |
 | `http.range` ≠ 206 | `dataServer` in `cmd/portal/main.go`; `http.FileServer` must handle Range natively or DuckDB-WASM pulls whole files |
 | `http.traversal` ≠ 404 | the `EvalSymlinks` prefix guard in `dataServer` |
 | `http.cache` | `servePage` / `serveImmutable` / `buildAssets` in `cmd/portal/main.go` |

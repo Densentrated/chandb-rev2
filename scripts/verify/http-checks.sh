@@ -78,9 +78,12 @@ fi
 
 # /api/datasets — names and non-empty file lists.
 #
-# These seven are what goldTables in cmd/pipeline/gold.go produces. Pinning the
-# list is deliberate: a dataset silently disappearing is exactly the regression
-# that leaves the portal up and every page empty.
+# What goldTables in cmd/pipeline/gold.go and broadbandTables in broadband.go
+# produce. Pinning the list is deliberate: a dataset silently disappearing is
+# exactly the regression that leaves the portal up and every page empty.
+#
+# Add new gold tables here. An unlisted table is served but unguarded — which
+# is how the broadband tables shipped green while being entirely untested.
 WANT_DATASETS=(
   bart_stop_events
   mbta_stop_events
@@ -89,6 +92,8 @@ WANT_DATASETS=(
   septa_vehicle_positions
   septarail_stop_events
   septarail_vehicle_positions
+  broadband_tract_measured
+  broadband_tract_coverage
 )
 datasets_body="${RUN_DIR}/api-datasets.json"
 status=$(curl -s -o "$datasets_body" -w '%{http_code}' --max-time 10 \
@@ -212,7 +217,8 @@ else
     [[ "$cc" == *immutable* ]] || { cache_ok=0; say "${hashed} Cache-Control=${cc}"; }
   done
 fi
-for path in /chandb.js /index.js /board.js /maps.js / /board /maps; do
+for path in /chandb.js /index.js /board.js /maps.js /broadband.js \
+            / /board /maps /broadband; do
   cc=$(cache_of "${PORTAL_BASE}${path}")
   log_http http.cache GET "$path" 200 "$cc"
   [[ "$cc" == *no-cache* ]] || { cache_ok=0; say "${path} Cache-Control=${cc}"; }
@@ -228,7 +234,8 @@ fi
 # Every page asset must be 2xx. A 404 on portal.css is invisible in a headless
 # screenshot diff but means the whole page renders unstyled.
 assets_ok=1
-page_assets=(/ /board /maps /portal.css /chandb.js /index.js /board.js /maps.js
+page_assets=(/ /board /maps /broadband /portal.css
+             /chandb.js /index.js /board.js /maps.js /broadband.js
              /api/datasets /healthz)
 for path in "${page_assets[@]}"; do
   status=$(code_of "${PORTAL_BASE}${path}")

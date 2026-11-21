@@ -1,9 +1,17 @@
 # chandb-rev2
 
-Archives live transit data from **MBTA** (Boston), **BART** (SF Bay Area) and
-**SEPTA** (Philadelphia), and publishes it as a public website where anyone can
-run SQL against the archive, read a live departure board, or look at where
-trains actually run.
+A public data lake you can query from your browser. Two domains:
+
+**Transit** — archives live data from **MBTA** (Boston), **BART** (SF Bay Area)
+and **SEPTA** (Philadelphia): run SQL against the archive, read a live
+departure board, or look at where trains actually run.
+
+**Broadband** — compares what ISPs *claim* they serve to the FCC against what
+can actually be measured, per census tract, for Boston and the Bay Area. The
+FCC's map is self-reported and is what federal funding is allocated from; the
+disagreement between claimed coverage, measured speed, and actual subscription
+is the point. Measured speed is not availability, and a tract with no speed
+tests is *unmeasured*, not *unserved* — the views say so.
 
 **The server never runs a query.** It is a static file server. Your browser
 downloads DuckDB compiled to WebAssembly and queries the Parquet files directly
@@ -26,7 +34,7 @@ Cloudflare tunnel.
 ```
 go test -race ./...
 make setup          # one time: Playwright + chromium for the verify harness
-make verify         # seed a lake, boot the portal, drive all three pages
+make verify         # seed a lake, boot the portal, drive all four pages
 ```
 
 To run it against real data:
@@ -35,7 +43,7 @@ To run it against real data:
 mkdir -p /tmp/lake
 LAKE_DIR=/tmp/lake go run ./cmd/pipeline -once     # real fetch + all transforms
 LAKE_DIR=/tmp/lake PORTAL_ADDR=:8080 go run ./cmd/portal
-# open http://localhost:8080, /board and /maps
+# open http://localhost:8080, /board, /maps and /broadband
 ```
 
 The pipeline needs a C toolchain — DuckDB uses cgo. `make help` lists every
@@ -45,7 +53,7 @@ target.
 
 `go test` covers the server, but the query engine runs in the browser, so a
 green test suite is compatible with every page rendering blank. `make verify`
-seeds a deterministic lake, boots the portal, drives all three pages in
+seeds a deterministic lake, boots the portal, drives all four pages in
 headless chromium, and writes screenshots, a console log, a Playwright trace
 and a PASS/FAIL table to `.verify/latest/`. It exits **0** pass, **1** broken,
 **2** blocked by infrastructure.

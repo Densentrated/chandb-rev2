@@ -20,6 +20,7 @@
 package main
 
 import (
+	"database/sql"
 	"flag"
 	"fmt"
 	"log"
@@ -30,6 +31,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	_ "github.com/marcboeker/go-duckdb/v2"
 )
 
 // staticTables mirrors cmd/pipeline/static.go: the three GTFS lookup tables
@@ -119,10 +122,84 @@ func seed(testdata, lake string, base time.Time) (int, error) {
 			}
 		}
 	}
+	n, err := seedBroadband(testdata, lake, base)
+	if err != nil {
+		return written, err
+	}
+	written += n
+
 	if written == 0 {
 		return 0, fmt.Errorf("no fixtures found under %s", testdata)
 	}
 	return written, nil
+}
+
+// seedBroadband converts the CSV fixtures next to the transit ones into the
+// bronze Parquet that transformBroadbandGold reads.
+//
+// CSV is the committed form on purpose: a Parquet fixture is opaque in a diff,
+// and the whole point of committing inputs rather than outputs is that a human
+// can see what changed. DuckDB does the conversion, so the fixture goes through
+// the same reader the real data does.
+//
+// The directory sits BESIDE testdata/lake rather than inside it, because seed()
+// above treats every directory under testdata/lake as a transit agency with
+// GTFS tables, and broadband has neither.
+func seedBroadband(testdata, lake string, base time.Time) (int, error) {
+	src := filepath.Join(filepath.Dir(testdata), "lake-broadband")
+	tracts := filepath.Join(src, "tracts.csv")
+	tiles := filepath.Join(src, "ookla_tiles.csv")
+	if _, err := os.Stat(tracts); err != nil {
+		return 0, nil // no broadband fixtures; transit-only seed is still valid
+	}
+
+	dt := "dt=" + base.Format("2006-01-02")
+	snapshot := base.Format("20060102T150405Z") + ".parquet"
+
+	db, err := sql.Open("duckdb", "")
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = db.Close() }()
+
+	type job struct{ out, query string }
+	var jobs []job
+
+	// Tract geometry, split per state exactly as the real TIGER extract does.
+	for _, state := range []string{"25", "06"} {
+		jobs = append(jobs, job{
+			out: filepath.Join(lake, "bronze", "census", "tiger_tracts_"+state, dt, snapshot),
+			query: fmt.Sprintf(
+				`SELECT * FROM read_csv('%s', header=true,
+                   types={'geoid':'VARCHAR','state_fips':'VARCHAR','county_fips':'VARCHAR'})
+                 WHERE state_fips = '%s'`, tracts, state),
+		})
+	}
+
+	// Ookla tiles, stamped to the quarter containing the seed time so the
+	// fixture never looks stale to a query that filters on it.
+	year, quarter := base.Year(), (int(base.Month())-1)/3+1
+	jobs = append(jobs, job{
+		out: filepath.Join(lake, "bronze", "ookla", "fixed_performance", dt, snapshot),
+		query: fmt.Sprintf(
+			`SELECT quadkey, lon, lat, down_mbps, up_mbps, latency_ms, tests, devices,
+               %d AS src_year, %d AS src_quarter,
+               DATE '%d-%02d-01' AS src_quarter_start
+             FROM read_csv('%s', header=true, types={'quadkey':'VARCHAR'})`,
+			year, quarter, year, (quarter-1)*3+1, tiles),
+	})
+
+	for _, j := range jobs {
+		if err := os.MkdirAll(filepath.Dir(j.out), 0o755); err != nil {
+			return 0, err
+		}
+		stmt := fmt.Sprintf("COPY (%s) TO '%s' (FORMAT PARQUET, COMPRESSION ZSTD)",
+			j.query, j.out)
+		if _, err := db.Exec(stmt); err != nil {
+			return 0, fmt.Errorf("seed %s: %w", j.out, err)
+		}
+	}
+	return len(jobs), nil
 }
 
 // stampNDJSON rewrites the @offset@ tokens and publishes the result.

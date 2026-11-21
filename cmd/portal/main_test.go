@@ -84,6 +84,7 @@ func TestPagesReferenceTheHashedModules(t *testing.T) {
 	shared := moduleByPath(t, a, "/chandb.js")
 	for route, pageModule := range map[string]string{
 		"/": "/index.js", "/board": "/board.js", "/maps": "/maps.js",
+		"/broadband": "/broadband.js",
 	} {
 		page := string(a.pages[route])
 		own := moduleByPath(t, a, pageModule)
@@ -113,7 +114,9 @@ func TestHashedPathTracksContent(t *testing.T) {
 	chandbJS = orig
 	restored := buildAssets()
 
-	for _, path := range []string{"/chandb.js", "/index.js", "/board.js", "/maps.js"} {
+	for _, path := range []string{
+		"/chandb.js", "/index.js", "/board.js", "/maps.js", "/broadband.js",
+	} {
 		a, b := moduleByPath(t, first, path), moduleByPath(t, changed, path)
 		if a.hashedPath == b.hashedPath {
 			t.Errorf("%s: editing the shared runtime did not change its URL", path)
@@ -201,6 +204,59 @@ func TestMapsPageIsServed(t *testing.T) {
 	for _, want := range []string{"activity cells", "canvas", "vehicle_positions"} {
 		if !strings.Contains(js, want) {
 			t.Errorf("maps module missing %q", want)
+		}
+	}
+}
+
+// The broadband page's whole reason to exist is the distinction between "slow"
+// and "not measured", and that distinction lives in prose and class names that
+// nothing else would catch if they were edited away. Assert the markup carries
+// the caveat and the no-data treatment, and the module carries the honesty
+// machinery: evidence tiers, the unmeasured branch, and the graceful-degrade
+// hooks for the FCC and ACS tables that do not exist yet.
+func TestBroadbandPageIsServed(t *testing.T) {
+	a := buildAssets()
+	rec := httptest.NewRecorder()
+	servePage(a.pages["/broadband"], "text/html; charset=utf-8")(
+		rec, httptest.NewRequest(http.MethodGet, "/broadband", nil))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	body := rec.Body.String()
+	for _, want := range []string{
+		"ledger", "tile-unmeasured", "dist-unmeasured", "chart-evidence",
+		"tracts-boston", "tracts-bayarea", "table-caption", "unmeasured-list",
+		// The caveat must stay ABOVE the data and must stay worded as a
+		// warning; a reader who stops after the first chart has still read it.
+		"Read this before the numbers",
+		"A measured speed is not an availability map",
+		"No tests means unmeasured, never unserved",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("broadband markup missing %q", want)
+		}
+	}
+	// Nav consistency: every page offers every other page.
+	for _, page := range []string{"/", "/board", "/maps", "/broadband"} {
+		for _, route := range []string{`href="/"`, `href="/board"`, `href="/maps"`, `href="/broadband"`} {
+			if !strings.Contains(string(a.pages[page]), route) {
+				t.Errorf("page %s nav is missing %s", page, route)
+			}
+		}
+	}
+
+	js := string(moduleByPath(t, a, "/broadband.js").body)
+	for _, want := range []string{
+		"broadband_tract_coverage", "broadband_tract_measured",
+		"unmeasured", "tierOf", "share_tests_over_100",
+		// Declared but absent upstream. These must stay listed so the columns
+		// appear the day the credentials land, and must stay OPTIONAL so the
+		// page keeps rendering until then.
+		"broadband_tract_claimed", "broadband_tract_demographics",
+	} {
+		if !strings.Contains(js, want) {
+			t.Errorf("broadband module missing %q", want)
 		}
 	}
 }

@@ -18,7 +18,7 @@ const REPO_ROOT = fileURLToPath(new URL('../..', import.meta.url));
 const RUN_DIR = process.env.RUN_DIR;
 const CHECKS_TSV = process.env.CHECKS_TSV;
 const PORTAL = join(REPO_ROOT, 'cmd', 'portal');
-const PAGES = ['index.html', 'board.html', 'maps.html'];
+const PAGES = ['index.html', 'board.html', 'maps.html', 'broadband.html'];
 
 const lines = [];
 const log = (s) => { lines.push(s); console.log(s); };

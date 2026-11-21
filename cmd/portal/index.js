@@ -134,6 +134,64 @@ WHERE route_short_name IS NOT NULL
 GROUP BY 1, 2
 ORDER BY vehicles DESC
 LIMIT 25;` },
+
+  { table: 'broadband_tract_coverage', label: 'Measured vs unmeasured tracts', sql:
+`-- A tract with no speed test is UNMEASURED, not unserved. Counting it as a
+-- zero is the single easiest way to misread this dataset, so the two are
+-- separated here rather than averaged together.
+SELECT metro,
+       count(*)                                     AS tracts,
+       count(*) FILTER (WHERE NOT unmeasured)       AS measured,
+       count(*) FILTER (WHERE unmeasured)           AS no_test_at_all,
+       sum(tests)                                   AS tests,
+       round(median(down_mbps_weighted), 1)         AS median_tract_mbps
+FROM broadband_tract_coverage
+GROUP BY 1
+ORDER BY 1;` },
+
+  { table: 'broadband_tract_measured', label: 'Slowest measured tracts', sql:
+`-- "Slow" here means slow MEASUREMENTS. It is not evidence that service is
+-- unavailable: people may simply be buying cheap plans. The tests column is
+-- the confidence signal — a tract resting on 12 tests is not comparable to
+-- one resting on 2,000, so it is selected alongside and never hidden.
+SELECT tract_name,
+       round(down_mbps_weighted, 1)        AS down_mbps,
+       round(down_mbps_median, 1)          AS tile_median_mbps,
+       tests,
+       round(100 * share_tests_over_100, 1) AS pct_tests_over_100,
+       CASE WHEN tests >= 1000 THEN 'strong'
+            WHEN tests >=  200 THEN 'moderate'
+            ELSE                    'thin — treat with care'
+       END                                  AS evidence
+FROM broadband_tract_measured
+ORDER BY down_mbps_weighted
+LIMIT 40;` },
+
+  { table: 'broadband_tract_measured', label: 'Does the number rest on few tiles?', sql:
+`-- down_mbps_weighted is test-weighted; down_mbps_median is the unweighted
+-- median across the ~600m tiles in the tract. A large gap means one busy tile
+-- is carrying the headline figure for the whole tract.
+SELECT tract_name, tiles, tests,
+       round(down_mbps_weighted, 1)                    AS weighted,
+       round(down_mbps_median, 1)                      AS tile_median,
+       round(down_mbps_weighted - down_mbps_median, 1) AS gap
+FROM broadband_tract_measured
+WHERE down_mbps_median > 0
+ORDER BY abs(down_mbps_weighted - down_mbps_median) DESC
+LIMIT 40;` },
+
+  { table: 'broadband_tract_coverage', label: 'Where is measurement thinnest?', sql:
+`-- tiles_per_km2 is measurement density, not service density. A dense urban
+-- tract with almost no tiles is a measurement gap; a sparse one may just be
+-- empty land, which is why land_m2 is shown next to it.
+SELECT tract_name, metro,
+       round(land_m2 / 1000000.0, 2)  AS land_km2,
+       tiles, tests,
+       round(tiles_per_km2, 2)        AS tiles_per_km2,
+       unmeasured
+FROM broadband_tract_coverage
+ORDER BY unmeasured DESC, tiles_per_km2
+LIMIT 40;` },
 ];
 
 let available = new Set();

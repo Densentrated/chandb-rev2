@@ -59,6 +59,9 @@ var boardHTML []byte
 //go:embed maps.html
 var mapsHTML []byte
 
+//go:embed broadband.html
+var broadbandHTML []byte
+
 // Shared browser runtime. Every page imports it, so the DuckDB-WASM setup and
 // dataset registration exist once rather than per page.
 //
@@ -76,6 +79,9 @@ var boardJS []byte
 
 //go:embed maps.js
 var mapsJS []byte
+
+//go:embed broadband.js
+var broadbandJS []byte
 
 //go:embed portal.css
 var portalCSS []byte
@@ -136,13 +142,15 @@ func buildAssets() assets {
 	index := hash("index.js", rewrite(indexJS, shared))
 	board := hash("board.js", rewrite(boardJS, shared))
 	maps := hash("maps.js", rewrite(mapsJS, shared))
+	broadband := hash("broadband.js", rewrite(broadbandJS, shared))
 
 	return assets{
-		modules: []module{shared, index, board, maps},
+		modules: []module{shared, index, board, maps, broadband},
 		pages: map[string][]byte{
-			"/":      rewrite(indexHTML, shared, index),
-			"/board": rewrite(boardHTML, shared, board),
-			"/maps":  rewrite(mapsHTML, shared, maps),
+			"/":          rewrite(indexHTML, shared, index),
+			"/board":     rewrite(boardHTML, shared, board),
+			"/maps":      rewrite(mapsHTML, shared, maps),
+			"/broadband": rewrite(broadbandHTML, shared, broadband),
 		},
 		css: portalCSS,
 	}

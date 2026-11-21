@@ -151,6 +151,12 @@ async function settle(page, label) {
 
 async function capture(page, label) {
   if (!RUN_DIR) return;
+  // Scroll home first. The header is position:sticky, so a fullPage capture
+  // taken after a click near the foot of a long page paints the nav band
+  // across the middle of the image and hides whatever is underneath it —
+  // which on a long page is exactly the part worth looking at.
+  await page.evaluate(() => window.scrollTo(0, 0)).catch(() => {});
+  await page.waitForTimeout(120);
   await page.screenshot({
     path: join(RUN_DIR, 'screenshots', `${label}.png`), fullPage: true,
   }).catch(() => {});
@@ -423,6 +429,204 @@ async function driveMaps(context) {
   }
 }
 
+// --------------------------------------------------------------- /broadband
+
+// The broadband page's reason to exist is a distinction — "slow" versus "not
+// measured" — and a page that quietly collapsed the two would look completely
+// healthy from the outside: status bar green, charts full, no console error,
+// every number plausible. So these checks assert the distinction itself rather
+// than that something rendered.
+//
+// broadband.js pins a colour invariant for exactly this purpose: saturated ramp
+// colours mean a measured tract and nothing else, --ink-dim means "no data",
+// and the graticule is darker than both. That makes the three classes
+// separable in pixels, which is the only evidence that survives the page
+// swallowing its own exception.
+const BB_CANVASES = ['chart-evidence', 'tracts-boston', 'tracts-bayarea'];
+
+async function readBroadbandCanvases(page) {
+  return page.evaluate((ids) => {
+    const BG = [16, 16, 20];                 // --bg-raise, the panel fill
+    const out = {};
+    for (const id of ids) {
+      const host = document.getElementById(id);
+      const canvas = host?.querySelector('canvas');
+      if (!canvas) { out[id] = { error: 'no canvas element' }; continue; }
+      const w = canvas.width, h = canvas.height;
+      if (!w || !h) { out[id] = { error: `zero-sized canvas (${w}x${h})` }; continue; }
+
+      const data = canvas.getContext('2d').getImageData(2, 2, w - 4, h - 4).data;
+      let painted = 0, measured = 0, nodata = 0;
+      for (let i = 0; i < data.length; i += 4) {
+        const [r, g, b, a] = [data[i], data[i + 1], data[i + 2], data[i + 3]];
+        if (a === 0) continue;
+        if (r === BG[0] && g === BG[1] && b === BG[2]) continue;
+        painted++;
+        const max = Math.max(r, g, b), min = Math.min(r, g, b);
+        // Bright AND saturated: only the hsl(190..330 88% 64%) speed ramp
+        // reaches here. Antialiased ramp pixels darken towards the background
+        // rather than desaturating, so they never leak into the class below.
+        if (max > 150 && max - min > 60) measured++;
+        // Bright and grey: #91a6b8 only, which on these canvases is drawn
+        // nowhere except the hollow "no test" rings and the dashed
+        // annotations. The graticule (#22222a) and labels (#52677a) are too
+        // dark to qualify.
+        else if (max > 150) nodata++;
+      }
+      out[id] = { w, h, painted, measured, nodata };
+    }
+    return out;
+  }, BB_CANVASES);
+}
+
+const bbText = (page, id) =>
+  page.evaluate((i) => (document.getElementById(i)?.textContent || '').trim(), id);
+
+const bbInt = (text) => {
+  const m = /-?[\d,]+/.exec(text || '');
+  return m ? Number(m[0].replace(/,/g, '')) : NaN;
+};
+
+async function driveBroadband(context) {
+  const page = await openPage(context, '/broadband', 'broadband');
+  try {
+    if (!await settle(page, 'broadband')) { await capture(page, 'broadband'); return; }
+    await recordPaint(page, 'broadband');
+    await page.waitForTimeout(500);   // let the compositor finish the canvases
+
+    // --- ledger: measured and unmeasured are counted apart and add up.
+    const tracts = bbInt(await bbText(page, 'tile-tracts'));
+    const measured = bbInt(await bbText(page, 'tile-measured'));
+    const unmeasured = bbInt(await bbText(page, 'tile-unmeasured'));
+    const tests = bbInt(await bbText(page, 'tile-tests'));
+    if (!(tracts > 0) || measured + unmeasured !== tracts || !(tests > 0)) {
+      record('broadband.ledger', 'FAIL',
+        `ledger does not add up: ${tracts} tracts, ${measured} measured, ${unmeasured} unmeasured, ${tests} tests`,
+        'screenshots/broadband.png');
+      await capture(page, 'broadband');
+      return;
+    }
+    record('broadband.ledger', 'PASS',
+      `${tracts} tracts = ${measured} measured + ${unmeasured} unmeasured, ${tests} tests`);
+
+    // --- distribution: real bars, and the unmeasured count kept off the axis.
+    const dist = await page.evaluate(() => {
+      const rows = [...document.querySelectorAll('#dist .dist-row')];
+      return {
+        rows: rows.length,
+        bars: rows.filter(r => parseFloat(r.querySelector('.bar')?.style.width || '0') > 0).length,
+        segs: [...document.querySelectorAll('#dist .seg')].map(s => s.className),
+        note: (document.getElementById('dist-unmeasured')?.textContent || '').trim(),
+      };
+    });
+    if (dist.rows < 2 || dist.bars < 1 || dist.segs.length < 1) {
+      record('broadband.distribution', 'FAIL',
+        `${dist.rows} bin row(s), ${dist.bars} with a non-zero bar, ${dist.segs.length} evidence segment(s)`,
+        'screenshots/broadband.png');
+    } else if (unmeasured > 0 && !/no speed test/i.test(dist.note)) {
+      // An unmeasured tract must never acquire a position on a speed axis.
+      record('broadband.distribution', 'FAIL',
+        `${unmeasured} unmeasured tract(s) but the distribution does not say so: "${dist.note.slice(0, 90)}"`,
+        'screenshots/broadband.png');
+    } else {
+      record('broadband.distribution', 'PASS',
+        `${dist.bars}/${dist.rows} bins drawn, ${dist.segs.length} evidence segment(s); unmeasured kept off the axis`);
+    }
+
+    // --- canvases.
+    const stats = await readBroadbandCanvases(page);
+    const chart = stats['chart-evidence'];
+    if (chart.error || chart.painted === 0) {
+      record('broadband.evidence', 'FAIL',
+        `#chart-evidence: ${chart.error || 'canvas is fully blank'}`, 'screenshots/broadband.png');
+    } else if (chart.measured === 0) {
+      record('broadband.evidence', 'FAIL',
+        `#chart-evidence drew ${chart.painted} pixels of axes and annotation but plotted no tracts`,
+        'screenshots/broadband.png');
+    } else {
+      record('broadband.evidence', 'PASS',
+        `#chart-evidence: ${chart.measured} plotted-tract pixels of ${chart.painted} painted`);
+    }
+
+    // The load-bearing one. A map that rendered unmeasured tracts as slow, as
+    // blank, or not at all still passes every other check on this page.
+    const problems = [];
+    const detail = [];
+    for (const id of ['tracts-boston', 'tracts-bayarea']) {
+      const s = stats[id];
+      const reported = await bbText(page, `${id}-count`);
+      const noTest = bbInt(/·\s*([\d,]+)\s*with no test/.exec(reported)?.[1] ?? 'x');
+      if (s.error) { problems.push(`#${id}: ${s.error}`); continue; }
+      if (s.painted === 0) { problems.push(`#${id} is fully blank`); continue; }
+      if (s.measured === 0) problems.push(`#${id} plotted no measured tract (reported "${reported}")`);
+      if (noTest > 0 && s.nodata === 0) {
+        problems.push(`#${id} reports "${reported}" but drew no "no test" rings — `
+          + 'an unmeasured tract is being rendered as something else');
+      }
+      detail.push(`${id}: ${s.measured} speed px / ${s.nodata} no-test px (${reported})`);
+    }
+    record('broadband.tracts', problems.length ? 'FAIL' : 'PASS',
+      problems.length ? problems.join('; ') : detail.join(' · '),
+      problems.length ? 'screenshots/broadband.png' : '-');
+
+    // --- unmeasured tracts are listed on their own and never ranked.
+    const listed = await page.evaluate(() =>
+      document.querySelectorAll('#unmeasured-list .nodata-row').length);
+    const ranked = await page.evaluate(() =>
+      [...document.querySelectorAll('#table tbody tr')].filter(
+        tr => /no test/i.test(tr.textContent || '')).length);
+    if (unmeasured > 0 && listed === 0) {
+      record('broadband.unmeasured', 'FAIL',
+        `${unmeasured} tract(s) have no speed test but none are listed`, 'screenshots/broadband.png');
+    } else if (ranked > 0) {
+      record('broadband.unmeasured', 'FAIL',
+        `${ranked} unmeasured tract(s) leaked into the speed ranking`, 'screenshots/broadband.png');
+    } else {
+      record('broadband.unmeasured', 'PASS',
+        `${listed} unmeasured tract(s) listed separately, none in the ranking`);
+    }
+
+    // --- the evidence floor actually filters, and restores.
+    //
+    // Compare the caption's eligible TOTAL, not the rendered row count: the
+    // table is capped at 60 rows, so on the real ~1,900-tract lake a working
+    // filter can leave the visible count at exactly 60 and a count-based check
+    // would call that a regression. The total only ties if every tract in the
+    // lake clears 1,000 tests, which would itself be worth knowing.
+    const eligibleTotal = async () =>
+      bbInt(/of\s+([\d,]+)\s+measured/.exec(await bbText(page, 'table-caption'))?.[1] ?? 'x');
+    const clickFloor = async (nth) => {
+      await page.locator('#evidence button').nth(nth).click();
+      await page.waitForTimeout(250);
+      return eligibleTotal();
+    };
+    const floors = await page.locator('#evidence button').count();
+    const baseTotal = await eligibleTotal();
+    const strictTotal = floors > 1 ? await clickFloor(floors - 1) : baseTotal;
+    const restored = floors > 1 ? await clickFloor(0) : baseTotal;
+    const caption = await bbText(page, 'table-caption');
+    if (floors !== 3) {
+      record('broadband.filters', 'FAIL',
+        `expected 3 evidence-floor options, found ${floors}`, 'screenshots/broadband.png');
+    } else if (!(strictTotal < baseTotal)) {
+      record('broadband.filters', 'FAIL',
+        `the strictest evidence floor left ${strictTotal} eligible tract(s) of ${baseTotal} — it is not filtering`,
+        'screenshots/broadband.png');
+    } else if (restored !== baseTotal) {
+      record('broadband.filters', 'FAIL',
+        `clearing the evidence floor restored ${restored} tract(s), want ${baseTotal}`,
+        'screenshots/broadband.png');
+    } else {
+      record('broadband.filters', 'PASS',
+        `${baseTotal} eligible → strictest floor ${strictTotal} → any ${restored}; caption: ${caption.slice(0, 80)}`);
+    }
+
+    await capture(page, 'broadband');
+  } finally {
+    await page.close();
+  }
+}
+
 // ------------------------------------------------------------------- driver
 
 async function main() {
@@ -457,7 +661,8 @@ async function main() {
   await context.tracing.start({ screenshots: true, snapshots: true, sources: false });
 
   try {
-    for (const [name, fn] of [['index', driveIndex], ['board', driveBoard], ['maps', driveMaps]]) {
+    for (const [name, fn] of [['index', driveIndex], ['board', driveBoard],
+      ['maps', driveMaps], ['broadband', driveBroadband]]) {
       if (infra) break;
       if (budgetLeft() <= 0) {
         markInfra(`the browser tier used its ${TIER_BUDGET_MS / 60_000}-minute budget before reaching /${name === 'index' ? '' : name}`,
