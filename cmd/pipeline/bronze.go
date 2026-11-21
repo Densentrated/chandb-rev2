@@ -100,12 +100,41 @@ func transformBronze(ctx context.Context, lake string) {
 			return nil
 		}
 
-		// Static GTFS arrives as a zip of CSVs rather than protobuf, so it
-		// takes a different path out of raw.
+		// A zip is not self-describing: GTFS static is a zip of CSVs, TIGER is
+		// a zip of shapefiles, and handing one to the other's extractor fails
+		// with a confusing "routes.txt not present". Dispatch on the feed the
+		// snapshot came from, which is the only thing that actually knows.
 		if strings.HasSuffix(path, ".zip") {
-			if err := extractStatic(lake, path); err != nil {
-				slog.Warn("static extract failed", "file", path, "err", err)
-				failed++
+			_, feedName := agencyAndFeed(lake, path)
+			switch {
+			case feedName == "gtfs_static":
+				if err := extractStatic(lake, path); err != nil {
+					slog.Warn("static extract failed", "file", path, "err", err)
+					failed++
+				}
+			case strings.HasPrefix(feedName, "tiger_tracts"):
+				if err := extractTracts(ctx, lake, path); err != nil {
+					slog.Warn("tract extract failed", "file", path, "err", err)
+					failed++
+				}
+			default:
+				// Unmodelled zip. Left in raw for a later transform, exactly
+				// like the alerts feed — not an error.
+				slog.Debug("no zip decoder for feed", "feed", feedName, "file", path)
+			}
+			return nil
+		}
+		// Ookla arrives as Parquet already, but "already tabular" is not the
+		// same as "ready to join". Bronze is where the WKT tile polygon
+		// becomes a point and kbps becomes Mbps, so gold is a join rather
+		// than a pile of unit conversions.
+		if strings.HasSuffix(path, ".parquet") {
+			_, feedName := agencyAndFeed(lake, path)
+			if feedName == "fixed_performance" {
+				if err := normalizeOoklaTiles(ctx, lake, path); err != nil {
+					slog.Warn("ookla normalise failed", "file", path, "err", err)
+					failed++
+				}
 			}
 			return nil
 		}

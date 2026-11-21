@@ -44,72 +44,107 @@ func TestHealthzReturns200(t *testing.T) {
 // skew is what produces a silent SyntaxError and a page stuck on its first
 // status line.
 func TestPagesAreNeverCachedStale(t *testing.T) {
-	buildAssets()
-	for name, h := range map[string]http.HandlerFunc{
-		"index": handleIndex,
-		"board": servePage(boardPage, "text/html; charset=utf-8"),
-	} {
+	a := buildAssets()
+	for route, body := range a.pages {
+		h := servePage(body, "text/html; charset=utf-8")
+		if route == "/" {
+			h = handleIndex(body, "text/html; charset=utf-8")
+		}
 		rec := httptest.NewRecorder()
-		h(rec, httptest.NewRequest(http.MethodGet, "/", nil))
+		h(rec, httptest.NewRequest(http.MethodGet, route, nil))
 		if cc := rec.Header().Get("Cache-Control"); cc != "no-cache" {
-			t.Errorf("%s Cache-Control = %q, want no-cache", name, cc)
+			t.Errorf("%s Cache-Control = %q, want no-cache", route, cc)
 		}
 	}
 }
 
-func TestPagesReferenceTheHashedModule(t *testing.T) {
-	buildAssets()
-	if !strings.HasPrefix(hashedJSPath, "/chandb.") ||
-		!strings.HasSuffix(hashedJSPath, ".js") || len(hashedJSPath) < 20 {
-		t.Fatalf("hashed path looks wrong: %q", hashedJSPath)
-	}
-	for name, body := range map[string][]byte{"index": indexPage, "board": boardPage} {
-		if !strings.Contains(string(body), hashedJSPath) {
-			t.Errorf("%s does not import the hashed module %s", name, hashedJSPath)
+// moduleByPath finds a built module by its plain name, e.g. "/board.js".
+func moduleByPath(t *testing.T, a assets, path string) module {
+	t.Helper()
+	for _, m := range a.modules {
+		if m.path == path {
+			return m
 		}
-		if strings.Contains(string(body), "'/chandb.js'") {
-			t.Errorf("%s still imports the unhashed module", name)
+	}
+	t.Fatalf("no module built for %s", path)
+	return module{}
+}
+
+func TestPagesReferenceTheHashedModules(t *testing.T) {
+	a := buildAssets()
+	for _, m := range a.modules {
+		stem := strings.TrimSuffix(m.path, ".js")
+		if !strings.HasPrefix(m.hashedPath, stem+".") ||
+			!strings.HasSuffix(m.hashedPath, ".js") ||
+			len(m.hashedPath) != len(stem)+16 {
+			t.Errorf("hashed path for %s looks wrong: %q", m.path, m.hashedPath)
+		}
+	}
+
+	shared := moduleByPath(t, a, "/chandb.js")
+	for route, pageModule := range map[string]string{
+		"/": "/index.js", "/board": "/board.js", "/maps": "/maps.js",
+		"/broadband": "/broadband.js",
+	} {
+		page := string(a.pages[route])
+		own := moduleByPath(t, a, pageModule)
+		if !strings.Contains(page, own.hashedPath) {
+			t.Errorf("%s does not load the hashed %s", route, pageModule)
+		}
+		// The page references its own module; that module is what imports the
+		// shared runtime, so the hashed chandb path must appear there.
+		if !strings.Contains(string(own.body), shared.hashedPath) {
+			t.Errorf("%s does not import the hashed shared runtime", pageModule)
+		}
+		if strings.Contains(string(own.body), "'/chandb.js'") {
+			t.Errorf("%s still imports the unhashed shared runtime", pageModule)
 		}
 	}
 }
 
-// Changing the module must change its URL, or caches keep the old bytes.
+// Changing a module must change its URL, or caches keep the old bytes. It must
+// also change every dependent's URL: a page module that inlines the shared
+// runtime's hashed path has new content the moment that path moves.
 func TestHashedPathTracksContent(t *testing.T) {
-	buildAssets()
-	first := hashedJSPath
+	first := buildAssets()
 
 	orig := chandbJS
 	chandbJS = append(append([]byte{}, orig...), []byte("\n// changed\n")...)
-	buildAssets()
-	changed := hashedJSPath
-
+	changed := buildAssets()
 	chandbJS = orig
-	buildAssets()
+	restored := buildAssets()
 
-	if first == changed {
-		t.Error("different module content produced the same URL")
-	}
-	if hashedJSPath != first {
-		t.Error("restoring the content did not restore the URL")
+	for _, path := range []string{
+		"/chandb.js", "/index.js", "/board.js", "/maps.js", "/broadband.js",
+	} {
+		a, b := moduleByPath(t, first, path), moduleByPath(t, changed, path)
+		if a.hashedPath == b.hashedPath {
+			t.Errorf("%s: editing the shared runtime did not change its URL", path)
+		}
+		if c := moduleByPath(t, restored, path); c.hashedPath != a.hashedPath {
+			t.Errorf("%s: restoring the content did not restore the URL", path)
+		}
 	}
 }
 
 func TestHashedModuleIsImmutable(t *testing.T) {
-	buildAssets()
-	rec := httptest.NewRecorder()
-	serveImmutable(chandbJS, "text/javascript; charset=utf-8")(
-		rec, httptest.NewRequest(http.MethodGet, hashedJSPath, nil))
+	a := buildAssets()
+	for _, m := range a.modules {
+		rec := httptest.NewRecorder()
+		serveImmutable(m.body, jsType)(
+			rec, httptest.NewRequest(http.MethodGet, m.hashedPath, nil))
 
-	cc := rec.Header().Get("Cache-Control")
-	if !strings.Contains(cc, "immutable") {
-		t.Errorf("Cache-Control = %q, want immutable", cc)
+		if cc := rec.Header().Get("Cache-Control"); !strings.Contains(cc, "immutable") {
+			t.Errorf("%s Cache-Control = %q, want immutable", m.hashedPath, cc)
+		}
 	}
 }
 
 func TestIndexServesHTML(t *testing.T) {
-	buildAssets()
+	a := buildAssets()
 	rec := httptest.NewRecorder()
-	handleIndex(rec, httptest.NewRequest(http.MethodGet, "/", nil))
+	handleIndex(a.pages["/"], "text/html; charset=utf-8")(
+		rec, httptest.NewRequest(http.MethodGet, "/", nil))
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", rec.Code)
@@ -117,55 +152,111 @@ func TestIndexServesHTML(t *testing.T) {
 	if ct := rec.Header().Get("Content-Type"); !strings.HasPrefix(ct, "text/html") {
 		t.Errorf("content-type = %q, want text/html", ct)
 	}
-	// The engine setup lives in the shared module now, not inline.
-	if !strings.Contains(rec.Body.String(), hashedJSPath) {
-		t.Error("page should import the hashed shared runtime")
+	if !strings.Contains(rec.Body.String(), moduleByPath(t, a, "/index.js").hashedPath) {
+		t.Error("page should load the hashed page module")
 	}
 }
 
 func TestBoardPageIsServed(t *testing.T) {
-	buildAssets()
+	a := buildAssets()
 	rec := httptest.NewRecorder()
-	servePage(boardPage, "text/html; charset=utf-8")(
+	servePage(a.pages["/board"], "text/html; charset=utf-8")(
 		rec, httptest.NewRequest(http.MethodGet, "/board", nil))
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", rec.Code)
 	}
+	// Markup lives in the page; behaviour lives in the module. Assert each
+	// against the artifact that actually carries it.
 	body := rec.Body.String()
-	if !strings.Contains(body, hashedJSPath) {
-		t.Error("board should import the hashed shared runtime")
-	}
-	if !strings.Contains(body, "stop_events") {
-		t.Error("board should query a stop_events table")
-	}
-	for _, want := range []string{"Show all departures", "timeline", "Back to board", "departure_delay"} {
+	for _, want := range []string{"timeline", "Back to board", "Filter stations"} {
 		if !strings.Contains(body, want) {
-			t.Errorf("board visualization missing %q", want)
+			t.Errorf("board markup missing %q", want)
+		}
+	}
+	js := string(moduleByPath(t, a, "/board.js").body)
+	for _, want := range []string{"stop_events", "Show all departures", "departure_delay"} {
+		if !strings.Contains(js, want) {
+			t.Errorf("board module missing %q", want)
 		}
 	}
 }
 
 func TestMapsPageIsServed(t *testing.T) {
-	buildAssets()
+	a := buildAssets()
 	rec := httptest.NewRecorder()
-	servePage(mapsPage, "text/html; charset=utf-8")(
+	servePage(a.pages["/maps"], "text/html; charset=utf-8")(
 		rec, httptest.NewRequest(http.MethodGet, "/maps", nil))
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", rec.Code)
 	}
 	body := rec.Body.String()
-	if !strings.Contains(body, hashedJSPath) {
-		t.Error("maps should import the hashed shared runtime")
-	}
 	for _, want := range []string{
 		"map-world", "map-boston", "map-bay", "map-philadelphia",
-		"24-hour activity", "activity cells", "San Francisco Bay Area",
-		"canvas", "dark grid",
+		"24-hour activity", "San Francisco Bay Area", "dark grid",
 	} {
 		if !strings.Contains(body, want) {
-			t.Errorf("maps page missing %q", want)
+			t.Errorf("maps markup missing %q", want)
+		}
+	}
+	js := string(moduleByPath(t, a, "/maps.js").body)
+	for _, want := range []string{"activity cells", "canvas", "vehicle_positions"} {
+		if !strings.Contains(js, want) {
+			t.Errorf("maps module missing %q", want)
+		}
+	}
+}
+
+// The broadband page's whole reason to exist is the distinction between "slow"
+// and "not measured", and that distinction lives in prose and class names that
+// nothing else would catch if they were edited away. Assert the markup carries
+// the caveat and the no-data treatment, and the module carries the honesty
+// machinery: evidence tiers, the unmeasured branch, and the graceful-degrade
+// hooks for the FCC and ACS tables that do not exist yet.
+func TestBroadbandPageIsServed(t *testing.T) {
+	a := buildAssets()
+	rec := httptest.NewRecorder()
+	servePage(a.pages["/broadband"], "text/html; charset=utf-8")(
+		rec, httptest.NewRequest(http.MethodGet, "/broadband", nil))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	body := rec.Body.String()
+	for _, want := range []string{
+		"ledger", "tile-unmeasured", "dist-unmeasured", "chart-evidence",
+		"tracts-boston", "tracts-bayarea", "table-caption", "unmeasured-list",
+		// The caveat must stay ABOVE the data and must stay worded as a
+		// warning; a reader who stops after the first chart has still read it.
+		"Read this before the numbers",
+		"A measured speed is not an availability map",
+		"No tests means unmeasured, never unserved",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("broadband markup missing %q", want)
+		}
+	}
+	// Nav consistency: every page offers every other page.
+	for _, page := range []string{"/", "/board", "/maps", "/broadband"} {
+		for _, route := range []string{`href="/"`, `href="/board"`, `href="/maps"`, `href="/broadband"`} {
+			if !strings.Contains(string(a.pages[page]), route) {
+				t.Errorf("page %s nav is missing %s", page, route)
+			}
+		}
+	}
+
+	js := string(moduleByPath(t, a, "/broadband.js").body)
+	for _, want := range []string{
+		"broadband_tract_coverage", "broadband_tract_measured",
+		"unmeasured", "tierOf", "share_tests_over_100",
+		// Declared but absent upstream. These must stay listed so the columns
+		// appear the day the credentials land, and must stay OPTIONAL so the
+		// page keeps rendering until then.
+		"broadband_tract_claimed", "broadband_tract_demographics",
+	} {
+		if !strings.Contains(js, want) {
+			t.Errorf("broadband module missing %q", want)
 		}
 	}
 }
@@ -192,7 +283,8 @@ func TestSharedRuntimeServedAsJavaScript(t *testing.T) {
 
 func TestIndexDoesNotSwallowUnknownPaths(t *testing.T) {
 	rec := httptest.NewRecorder()
-	handleIndex(rec, httptest.NewRequest(http.MethodGet, "/nope", nil))
+	handleIndex(buildAssets().pages["/"], "text/html; charset=utf-8")(
+		rec, httptest.NewRequest(http.MethodGet, "/nope", nil))
 	if rec.Code != http.StatusNotFound {
 		t.Errorf("status = %d, want 404", rec.Code)
 	}
@@ -217,7 +309,7 @@ func TestDatasetsGroupsByAgencyAndTable(t *testing.T) {
 	writeGold(t, gold, "mbta/vehicle_positions/dt=2026-10-07/notes.txt", "ignored")
 
 	rec := httptest.NewRecorder()
-	handleDatasets(gold)(rec, httptest.NewRequest(http.MethodGet, "/api/datasets", nil))
+	newCatalog(gold).serveHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/datasets", nil))
 
 	var sets []dataset
 	if err := json.Unmarshal(rec.Body.Bytes(), &sets); err != nil {
@@ -256,7 +348,7 @@ func TestDatasetsGroupsByAgencyAndTable(t *testing.T) {
 // A missing gold tree means "nothing published yet", not an error page.
 func TestDatasetsEmptyGoldReturnsEmptyList(t *testing.T) {
 	rec := httptest.NewRecorder()
-	handleDatasets(filepath.Join(t.TempDir(), "absent"))(
+	newCatalog(filepath.Join(t.TempDir(), "absent")).serveHTTP(
 		rec, httptest.NewRequest(http.MethodGet, "/api/datasets", nil))
 
 	if rec.Code != http.StatusOK {

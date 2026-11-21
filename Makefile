@@ -1,65 +1,75 @@
-.PHONY: up down logs ingest sweep du psql metabase reset dev-up dev-down dev-ingest dev-reset tunnel
+# Task runner for chandb-rev2.
+#
+# Two Go binaries and a lake of files on disk. There is no local Postgres, no
+# Metabase and no Python: the query engine is DuckDB-WASM in the visitor's
+# browser, and cmd/portal is a static file server. See docs/how-it-works.md.
 
-up:            ## start postgres + metabase
-	docker compose up -d postgres metabase
+.PHONY: help duckdb-ext verify verify-seed verify-portal verify-stop verify-static \
+        verify-http verify-browser setup test lint ci dev-portal dev-pipeline \
+        rebuild clean
 
-down:
-	docker compose down
+LAKE ?= .verify/lake
 
-logs:
-	docker compose logs -f --tail=100
+help:          ## list targets
+	@grep -hE '^[a-z-]+:.*?##' $(MAKEFILE_LIST) \
+	  | sed 's/:.*##/\t/' | sort | awk -F'\t' '{printf "  %-16s %s\n", $$1, $$2}'
 
-ingest:        ## run the pipeline once (one-shot job, not a daemon)
-	docker compose run --rm pipeline python -m pipeline.main ingest
+# --------------------------------------------------------------------- verify
+# The harness that proves the app actually works. A green `go test` says
+# nothing about whether /maps drew anything — the engine runs in the browser.
+# Full documentation lives in .claude/skills/verify/SKILL.md.
 
-sweep:         ## retention + compaction + storage accounting
-	docker compose run --rm pipeline python -m pipeline.main sweep
+setup:         ## one-time: Playwright chromium + DuckDB extensions
+	npm install && npx playwright install chromium
+	$(MAKE) duckdb-ext
 
-du:            ## per-stream disk usage as the pipeline sees it
-	docker compose run --rm pipeline python -m pipeline.main du
-	@echo "--- host view ---"
-	@du -sh ./lake 2>/dev/null || true
+duckdb-ext:    ## install httpfs + spatial locally (baked into the image in CI)
+	DUCKDB_EXTENSION_DIR=$$HOME/.duckdb/extensions go run ./cmd/pipeline -install-extensions
 
-psql:
-	docker compose exec postgres psql -U postgres -d lakehouse
+verify:        ## seed, boot, drive all four pages, write .verify/latest/summary.md
+	scripts/verify/run.sh
 
-metabase:      ## open the dashboard
-	@echo "http://localhost:3000"
+verify-seed:   ## rebuild $(LAKE) from testdata fixtures only
+	scripts/verify/seed-lake.sh
 
-reset:         ## DESTROYS postgres state. The lake on disk is left alone.
-	docker compose down -v
+verify-portal: ## serve $(LAKE) on :8099 (pair with verify-stop)
+	scripts/verify/start-portal.sh
 
-runner-setup:  ## one-time host setup for the self-hosted GitHub Actions runner
-	mkdir -p $$HOME/.config/lakehouse $$HOME/lakehouse-data
-	cp -n .env $$HOME/.config/lakehouse/env 2>/dev/null || true
-	chmod 600 $$HOME/.config/lakehouse/env
-	@echo "env  -> $$HOME/.config/lakehouse/env"
-	@echo "lake -> $$HOME/lakehouse-data"
-	@echo "Now add the runner: repo Settings > Actions > Runners > New self-hosted"
-	@echo "IMPORTANT: label it 'lakehouse', and keep the repo PRIVATE."
+verify-stop:   ## tear down the :8099 portal by pidfile
+	scripts/verify/stop-portal.sh
 
-ci:            ## run the same checks CI runs, locally
-	ruff check pipeline/ && python -m compileall -q pipeline/ && docker compose config --quiet
+verify-static: ## node --check every module + resolve every CSS custom property
+	node scripts/verify/static-checks.mjs
 
-# ---------------------------------------------------------------------
-# Local dev machine only. Separate project, ports, and lake — never
-# touches host data.
-# ---------------------------------------------------------------------
-DEV := docker compose -p lakehouse-dev -f docker-compose.yml -f docker-compose.dev.yml
+verify-http:   ## go suite plus live HTTP checks against a running portal
+	scripts/verify/http-checks.sh
 
-dev-up:        ## scratch stack on :3001 with lake-dev/
-	$(DEV) up -d postgres metabase
-	@echo "metabase (dev): http://localhost:3001"
+verify-browser: ## drive /, /board, /maps and /broadband in headless chromium
+	RUN_DIR=.verify/scratch node scripts/verify/drive.mjs
 
-dev-ingest:    ## run connectors against samples/ into lake-dev/
-	$(DEV) run --rm pipeline python -m pipeline.main ingest
+# ------------------------------------------------------------------- go basics
+test:          ## go test -race ./...
+	go test -race ./...
 
-dev-down:
-	$(DEV) down
+lint:          ## golangci-lint (same version CI runs)
+	golangci-lint run
 
-dev-reset:     ## wipe the scratch stack AND lake-dev/
-	$(DEV) down -v
-	rm -rf lake-dev/* && touch lake-dev/.gitkeep
+ci:            ## the checks CI runs, locally
+	go vet ./... && go build ./... && go test -race ./... && $(MAKE) verify
 
-tunnel:        ## reach the host's Metabase from here: make tunnel HOST=user@box
-	ssh -N -L 3000:localhost:3000 $(HOST)
+# ---------------------------------------------------------------------- local
+# Both read LAKE_DIR. Point it anywhere; /lake is only the container default.
+
+dev-pipeline:  ## one real fetch + all transforms into $(LAKE) (needs network)
+	mkdir -p $(LAKE)
+	LAKE_DIR=$(LAKE) go run ./cmd/pipeline -once
+
+rebuild:       ## re-derive bronze and gold from existing raw; no network
+	LAKE_DIR=$(LAKE) go run ./cmd/pipeline -rebuild
+
+dev-portal:    ## serve $(LAKE) on :8080
+	LAKE_DIR=$(LAKE) PORTAL_ADDR=:8080 go run ./cmd/portal
+
+clean:         ## remove verify artifacts; never touches a real lake
+	scripts/verify/stop-portal.sh || true
+	rm -rf .verify

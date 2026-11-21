@@ -1,0 +1,177 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>chandb — broadband</title>
+<link rel="stylesheet" href="/portal.css">
+<style>
+  /* Page-specific geometry only. Colour, borders and type live in portal.css,
+     which loads first so these rules override it rather than fight it. */
+  .caveat { max-width: 94ch; margin-bottom: 1.6rem; padding: 0.9rem 1.1rem; }
+  .caveat h3 { margin: 0 0 0.45rem; font-size: 0.68rem; letter-spacing: 0.18em; text-transform: uppercase; }
+  .caveat p { margin: 0 0 0.5rem; font-size: 0.72rem; }
+  .caveat p:last-child { margin-bottom: 0; }
+
+  .controls { display: flex; gap: 1.6rem; flex-wrap: wrap; align-items: center; margin-bottom: 1.4rem; }
+  .control { display: flex; gap: 0.45rem; align-items: center; flex-wrap: wrap; }
+  .control-label { font-size: 0.62rem; letter-spacing: 0.16em; text-transform: uppercase; }
+  .control button { padding: 4px 9px; }
+
+  .ledger { display: grid; grid-template-columns: repeat(auto-fit, minmax(176px, 1fr));
+            gap: 1rem; margin-bottom: 1.7rem; }
+  .tile { padding: 0.85rem 1rem; }
+  .tile .n { display: block; font-size: 1.55rem; line-height: 1.1; letter-spacing: -0.035em; }
+  .tile .k { display: block; margin-top: 0.25rem; font-size: 0.62rem; letter-spacing: 0.15em; text-transform: uppercase; }
+  .tile .note { display: block; margin-top: 0.45rem; font-size: 0.64rem; line-height: 1.45; }
+
+  .panels { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 1rem; }
+  .span-2 { grid-column: 1 / -1; }
+  .panel-head { display: flex; justify-content: space-between; gap: 1rem; align-items: baseline;
+                flex-wrap: wrap; padding: 0.8rem 1rem; }
+  .panel-head h3 { margin: 0; font-size: 0.9rem; }
+  .panel-head .count { font-size: 0.66rem; }
+  .panel-body { padding: 1rem; }
+  .panel-note { padding: 0.55rem 1rem; font-size: 0.66rem; line-height: 1.5; }
+
+  /* Distribution: label, bar, count. */
+  .dist { display: grid; gap: 0.35rem; }
+  .dist-row { display: grid; grid-template-columns: 7.5rem minmax(0, 1fr) 3.6rem;
+              gap: 0.6rem; align-items: center; font-size: 0.66rem; }
+  .dist-row .n { text-align: right; }
+  .bar-track { height: 1.05rem; }
+  .bar { display: flex; height: 100%; }
+  .seg { height: 100%; }
+  .nodata-row { margin-top: 0.7rem; padding: 0.5rem 0.6rem; font-size: 0.66rem; line-height: 1.5; }
+  .legend-swatches { display: flex; gap: 0.9rem; flex-wrap: wrap; margin-top: 0.8rem; font-size: 0.64rem; }
+  .legend-swatches > span { display: inline-flex; gap: 0.35rem; align-items: center; }
+  /* Two class names deep so it beats .seg's height:100%, which would otherwise
+     collapse a swatch that has no parent height to resolve against. */
+  .legend-swatches .swatch { display: inline-block; width: 0.8rem; height: 0.8rem; flex: none; }
+
+  .chart { position: relative; height: 320px; }
+  .chart canvas, .tmap canvas { display: block; width: 100%; height: 100%; }
+  .tmap { position: relative; height: 300px; }
+
+  .tablewrap { max-height: 60vh; overflow: auto; }
+  table { width: 100%; border-collapse: collapse; font-size: 0.66rem; line-height: 1.5; }
+  th, td { padding: 5px 9px; text-align: left; white-space: nowrap; border-bottom: 1px solid var(--line); }
+  th { position: sticky; top: 0; z-index: 1; }
+  td.num, th.num { text-align: right; }
+  td.empty { padding: 28px 10px; text-align: center; white-space: normal; }
+  caption { padding: 0 0 0.7rem; text-align: left; font-size: 0.66rem; line-height: 1.5; }
+  .tier { padding: 1px 5px; font-size: 0.58rem; letter-spacing: 0.1em; text-transform: uppercase; }
+
+  .unmeasured-list { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr));
+                     gap: 0.4rem; font-size: 0.66rem; max-height: 22rem; overflow: auto; }
+  .unmeasured-list div { padding: 0.35rem 0.55rem; }
+
+  @media (max-width: 860px) {
+    .panels { grid-template-columns: 1fr; }
+    .chart { height: 280px; }
+    .tmap { height: 260px; }
+  }
+</style>
+</head>
+<body>
+<header><div class="head"><div><h1>chandb</h1>
+  <div class="sub">
+    Ookla fixed-broadband speed tests by census tract.
+    <strong>Measured, not claimed</strong> — what a tester got, not what is available.
+  </div></div>
+  <nav aria-label="Primary"><a href="/">SQL explorer</a><a href="/board">Departure board</a><a href="/maps">Train maps</a><a href="/broadband" aria-current="page">Broadband</a></nav>
+</div></header>
+
+<main>
+  <section class="intro"><div class="eyebrow">Measured broadband</div><h2>What the tests actually say</h2><p>Every census tract in Suffolk County, Massachusetts and the nine-county San Francisco Bay Area, scored by the speed tests run inside it — and, just as importantly, by how much evidence that score rests on.</p></section>
+
+  <!-- The caveat sits above every number on the page, not under it. A reader
+       who stops after the first chart has still read it. -->
+  <section class="caveat" id="caveat">
+    <h3>Read this before the numbers</h3>
+    <p><strong>A measured speed is not an availability map.</strong> Ookla records
+    what a person got on the plan they already pay for, on the device they used.
+    A tract with no fibre at all can post fast numbers on good cable, and a
+    tract full of gigabit fibre can look slow if the people testing it buy the
+    cheapest tier.</p>
+    <p><strong>No tests means unmeasured, never unserved.</strong> Tracts with no
+    speed test are shown as missing data throughout this page — a dashed outline
+    and the words &ldquo;no test&rdquo; — and are never drawn as zero, blank or slow.</p>
+    <p><strong>A number resting on 12 tests is not the number resting on 2,000.</strong>
+    Every figure here carries its evidence tier, thin-evidence tracts are hatched
+    and dimmed rather than listed unqualified, and the evidence chart below exists
+    purely to show how far a sparsely-tested tract can wander.</p>
+    <p id="claimed-note">The FCC&rsquo;s claimed-coverage layer — the self-reported map
+    federal funding is allocated from — and the Census subscription figures are
+    not published in this lake yet. Until they are, nothing here can tell you
+    whether a provider&rsquo;s claim is true.</p>
+  </section>
+
+  <div id="status" role="status" aria-live="polite" aria-busy="true">Starting the in-browser query engine…</div>
+
+  <div class="controls">
+    <span class="control" id="metros" role="group" aria-label="Metro area">
+      <span class="control-label">Metro</span>
+    </span>
+  </div>
+
+  <section class="ledger" id="ledger" aria-label="Coverage ledger">
+    <div class="tile" id="tile-tracts"><span class="n">—</span><span class="k">Tracts</span><span class="note">Census tracts in the lake.</span></div>
+    <div class="tile" id="tile-measured"><span class="n">—</span><span class="k">With speed tests</span><span class="note">At least one Ookla tile falls inside the tract.</span></div>
+    <div class="tile nodata" id="tile-unmeasured"><span class="n">—</span><span class="k">No test at all</span><span class="note">Unmeasured. Not a speed of zero, and not evidence of no service.</span></div>
+    <div class="tile" id="tile-tests"><span class="n">—</span><span class="k">Speed tests</span><span class="note">Total tests behind every number on this page.</span></div>
+  </section>
+
+  <section class="panels">
+    <article class="panel">
+      <div class="panel-head"><h3>Distribution, split by evidence</h3><span class="count" id="dist-count">Loading…</span></div>
+      <div class="panel-body">
+        <div class="dist" id="dist"></div>
+        <div class="nodata-row" id="dist-unmeasured"></div>
+        <div class="legend-swatches" id="dist-legend"></div>
+      </div>
+      <div class="panel-note">Each bar is tracts, not people. The hatched part of a bar is tracts whose figure rests on fewer than 200 tests — notice where they cluster. 100 Mbps is the FCC&rsquo;s current benchmark for &ldquo;broadband&rdquo;; 25 Mbps is the one it replaced.</div>
+    </article>
+
+    <article class="panel">
+      <div class="panel-head"><h3>How much evidence is behind each tract</h3><span class="count" id="chart-count">Loading…</span></div>
+      <div class="panel-body"><div class="chart" id="chart-evidence"></div></div>
+      <div class="panel-note">One dot per measured tract: tests run (log scale) against the test-weighted download speed. The funnel is the point — tracts on the left can sit anywhere on the axis because almost nothing was measured there, so their position is close to noise. Dashed lines mark the 200- and 1,000-test evidence tiers.</div>
+    </article>
+
+    <article class="panel">
+      <div class="panel-head"><h3>Boston · Suffolk County</h3><span class="count" id="tracts-boston-count">Loading…</span></div>
+      <div class="panel-body"><div class="tmap" id="tracts-boston"></div></div>
+      <div class="panel-note">Tract centroids, not boundaries — gold publishes a centroid per tract, so this is a dot map rather than a choropleth. Filled dots are measured and coloured by speed (magenta slow, cyan fast); dot size is test count. Hollow grey rings are tracts with no test — a shape, not a colour on the speed scale.</div>
+    </article>
+
+    <article class="panel">
+      <div class="panel-head"><h3>San Francisco Bay Area · nine counties</h3><span class="count" id="tracts-bayarea-count">Loading…</span></div>
+      <div class="panel-body"><div class="tmap" id="tracts-bayarea"></div></div>
+      <div class="panel-note">Same encoding. A hollow grey ring and a filled magenta dot mean completely different things: one is a tract nobody tested, the other is a tract that tested slow.</div>
+    </article>
+
+    <article class="panel span-2">
+      <div class="panel-head">
+        <h3>Where the measured floor is lowest</h3>
+        <span class="control" id="evidence" role="group" aria-label="Evidence floor">
+          <span class="control-label">Evidence floor</span>
+        </span>
+      </div>
+      <div class="panel-body">
+        <table id="table"><caption id="table-caption">Loading…</caption></table>
+      </div>
+      <div class="panel-note">Slowest first. <strong>Low here means slow measurements, not absent service</strong> — and a slow tract with thin evidence may simply be a tract where four people tested on a cheap plan. The gap column is the test-weighted mean minus the unweighted tile median: a large gap means the tract&rsquo;s headline number is being carried by one or two busy tiles.</div>
+    </article>
+
+    <article class="panel span-2">
+      <div class="panel-head"><h3>Tracts with no speed test</h3><span class="count" id="unmeasured-count">Loading…</span></div>
+      <div class="panel-body"><div class="unmeasured-list" id="unmeasured-list"></div></div>
+      <div class="panel-note">These tracts are absent from every chart above because there is nothing to plot, not because they scored badly. A tract can go unmeasured for reasons that have nothing to do with its connectivity: almost nobody lives there, it is an airport or a park, or the people who live there do not run speed tests.</div>
+    </article>
+  </section>
+</main>
+
+<script type="module" src="/broadband.js"></script>
+</body>
+</html>

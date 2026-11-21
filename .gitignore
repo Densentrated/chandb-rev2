@@ -1,8 +1,10 @@
-.venv/
-.ruff_cache/
 deploy/.env
 *.retry
 docs/gitops-plan.md
 
 # Real host address + admin username; commit inventory.ini.example instead
 infra/ansible/inventory.ini
+
+# verify harness: generated lake, built binaries and run artifacts
+.verify/
+node_modules/

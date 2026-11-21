@@ -7,6 +7,7 @@
 //
 //	pipeline           # serve: fetch every INGEST_INTERVAL, forever
 //	pipeline -once     # single cycle, exit non-zero if any feed failed
+//	pipeline -rebuild  # re-derive bronze and gold from disk, no network
 //
 // Raw means raw: each feed's response body is written to disk byte-for-byte,
 // unparsed. GTFS-RT is protobuf, and the bytes carry their own header
@@ -22,11 +23,14 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"net/http"
 	"os"
@@ -48,6 +52,24 @@ const (
 	userAgent    = "chandb-rev2/0.1 (+https://github.com/Densentrated/chandb-rev2)"
 )
 
+// fetcher writes one snapshot into the lake and reports where it landed.
+//
+// The default (fetchFeed) is a plain GET of the whole body, which is the only
+// correct choice for an ephemeral feed: a GTFS-RT response exists for about
+// thirty seconds and is then gone forever, so raw has to be the replay buffer.
+// A source whose publisher archives its files permanently can override this —
+// see extractFetcher in broadband.go.
+type fetcher func(ctx context.Context, client *http.Client, url, lake string,
+	f feed, at time.Time) (string, int64, error)
+
+// authHeader names a request header whose value is read from a secret file.
+// Distinct from feed.secret, which substitutes into the URL: the FCC's API
+// wants credentials in headers, and a URL-embedded token would end up in logs.
+type authHeader struct {
+	header string
+	secret string
+}
+
 // feed is one endpoint to snapshot.
 type feed struct {
 	agency string
@@ -58,12 +80,28 @@ type feed struct {
 	// feed is skipped rather than failed, so this runs fine before you have
 	// a key.
 	secret string
+	// auth carries credentials in headers instead of the URL. Same
+	// skip-if-missing behaviour as secret.
+	auth []authHeader
 	// ext is the snapshot file extension, without the dot. Defaults to "pb".
 	ext string
 	// daily caps the feed at one snapshot per dt= partition. Static GTFS is
 	// a 24MB zip that changes about weekly; pulling it every 30 minutes would
 	// be 1.1GB/day of identical bytes.
 	daily bool
+	// every bounds how often a slow-changing source is re-fetched, measured
+	// from the newest snapshot already on disk. The broadband sources publish
+	// twice a year (FCC) or quarterly (Ookla); polling them every 30 minutes
+	// would be pure waste. Zero means every cycle, subject to daily.
+	every time.Duration
+	// dedupe drops a snapshot that is byte-identical to the newest one already
+	// stored. This is what keeps a weekly poll of a twice-yearly dataset from
+	// accumulating fifty identical copies, WITHOUT giving up the ability to
+	// re-derive everything from raw — unlike storing diffs, which cannot be
+	// replayed through changed parsing logic.
+	dedupe bool
+	// fetch overrides the default whole-body GET. nil means fetchFeed.
+	fetch fetcher
 }
 
 func (f feed) extension() string {
@@ -183,7 +221,30 @@ const ingestWorkers = 4
 func main() {
 	once := flag.Bool("once", false,
 		"run a single ingest cycle and exit instead of serving")
+	rebuild := flag.Bool("rebuild", false,
+		"re-derive bronze and gold from what is already in LAKE_DIR, then exit")
+	installExt := flag.Bool("install-extensions", false,
+		"download DuckDB extensions into DUCKDB_EXTENSION_DIR and exit (build step)")
 	flag.Parse()
+
+	// Build-time only. The runtime container is read-only and has no business
+	// fetching executable code, so extensions are baked into the image here
+	// and merely LOADed later.
+	if *installExt {
+		if err := installExtensions(); err != nil {
+			slog.Error("installing duckdb extensions failed", "err", err)
+			os.Exit(1)
+		}
+		return
+	}
+
+	if *rebuild {
+		if err := runRebuild(); err != nil {
+			slog.Error("rebuild failed", "err", err)
+			os.Exit(1)
+		}
+		return
+	}
 
 	if *once {
 		if err := runOnce(); err != nil {
@@ -273,6 +334,9 @@ func cycle(ctx context.Context, lake string) {
 	// and it backfills anything written before this stage existed.
 	transformBronze(ctx, lake)
 	transformGold(ctx, lake)
+	// Broadband reads the newest snapshot of each input rather than every
+	// partition, so it is a separate pass rather than more goldTables entries.
+	transformBroadbandGold(ctx, lake)
 	// Strictly after the transforms: pruning raw that has not reached gold
 	// would discard it permanently.
 	prune(ctx, lake)
@@ -320,6 +384,72 @@ func runOnce() error {
 			len(failed), strings.Join(failed, ", "))
 	}
 	return nil
+}
+
+// runRebuild re-derives the lake from what is already on disk: transforms
+// only, no fetch and no prune.
+//
+// It exists so a hand-assembled lake can be turned into gold by the real
+// transform. The alternative — writing Parquet by hand to test against — means
+// a second copy of the gold schema that drifts the moment gold.go changes, and
+// then the thing under test and the thing doing the testing disagree without
+// anyone noticing. Here gold.go stays the only definition of a gold row.
+//
+// ingestAll is skipped because it needs the network; prune is skipped because
+// a rebuild runs against inputs someone placed deliberately, and deleting them
+// afterwards would make the second run behave differently from the first.
+func runRebuild() error {
+	lake := lakeDir()
+	if _, err := os.Stat(lake); err != nil {
+		return fmt.Errorf("stat lake dir %s: %w", lake, err)
+	}
+
+	// Same budget as the -once backfill path: a full re-derive of retained raw
+	// is minutes of DuckDB work, and the fetch timeout is the wrong scale.
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+	defer cancel()
+
+	transformBronze(ctx, lake)
+	transformGold(ctx, lake)
+	// Broadband reads the newest snapshot of each input rather than every
+	// partition, so it is a separate pass rather than more goldTables entries.
+	transformBroadbandGold(ctx, lake)
+
+	// transformGold logs every failure and carries on, by design — one bad
+	// agency must not stop the rest. That makes "it ran" worthless as evidence,
+	// so count the output. Empty gold after a rebuild means the bronze inputs
+	// or the gold schema moved, and failing loudly here is what makes that
+	// visible instead of producing an empty portal.
+	n, err := countGoldParquet(lake)
+	if err != nil {
+		return fmt.Errorf("count gold: %w", err)
+	}
+	if n == 0 {
+		return fmt.Errorf("rebuild produced no parquet under %s",
+			filepath.Join(lake, "gold"))
+	}
+	slog.Info("rebuild ok", "gold_files", n)
+	return nil
+}
+
+func countGoldParquet(lake string) (int, error) {
+	var n int
+	err := filepath.WalkDir(filepath.Join(lake, "gold"),
+		func(p string, d fs.DirEntry, err error) error {
+			if err != nil {
+				return err
+			}
+			if !d.IsDir() && strings.HasSuffix(p, ".parquet") {
+				n++
+			}
+			return nil
+		})
+	// No gold tree at all is a legitimate state to report, not an error to
+	// propagate: the caller's "produced nothing" check is the one that matters.
+	if errors.Is(err, fs.ErrNotExist) {
+		err = nil
+	}
+	return n, err
 }
 
 func lakeDir() string {
@@ -371,6 +501,12 @@ func ingestAll(ctx context.Context, lake string) []string {
 			if f.daily && alreadyHaveToday(lake, f, now) {
 				continue
 			}
+			if f.every > 0 {
+				if last, ok := lastSnapshotAt(lake, f); ok &&
+					now.Sub(last) < f.every {
+					continue
+				}
+			}
 			url := f.url
 			if f.secret != "" {
 				key, err := readSecret(f.secret)
@@ -382,14 +518,33 @@ func ingestAll(ctx context.Context, lake string) []string {
 				}
 				url = strings.ReplaceAll(url, "{key}", key)
 			}
+			// Resolved up front so a missing credential skips the feed
+			// before any request goes out.
+			if _, err := resolveAuth(f); err != nil {
+				slog.Warn("skipping feed, secret unavailable",
+					"agency", f.agency, "feed", f.name, "err", err)
+				continue
+			}
 
-			path, n, err := fetchFeed(ctx, client, url, lake, f, now)
+			get := f.fetch
+			if get == nil {
+				get = fetchFeed
+			}
+			path, n, err := get(ctx, client, url, lake, f, now)
 			if err != nil {
 				slog.Error("feed failed",
 					"agency", f.agency, "feed", f.name, "err", err)
 				mu.Lock()
 				failed = append(failed, f.agency+"/"+f.name)
 				mu.Unlock()
+				continue
+			}
+			// An empty path means the fetcher deliberately stored nothing —
+			// dedupe found the bytes unchanged. That is a success, not a
+			// no-op worth alarming about.
+			if path == "" {
+				slog.Info("unchanged since last snapshot",
+					"agency", f.agency, "feed", f.name, "bytes", n)
 				continue
 			}
 			slog.Info("ingested",
@@ -433,6 +588,106 @@ func snapshotPath(lake string, f feed, at time.Time) (dir, file string) {
 	return dir, file
 }
 
+// lastSnapshotAt returns the timestamp of the newest snapshot on disk for this
+// feed. Snapshot filenames ARE the timestamp (20060102T150405Z), so the newest
+// name is the newest capture — no stat calls, and immune to the mtime churn a
+// restore or an rsync would cause.
+func lastSnapshotAt(lake string, f feed) (time.Time, bool) {
+	root := filepath.Join(lake, "raw", f.agency, f.name)
+	parts, err := os.ReadDir(root)
+	if err != nil {
+		return time.Time{}, false
+	}
+	suffix := "." + f.extension()
+	var newest time.Time
+	for _, p := range parts {
+		if !p.IsDir() || !dtPartition.MatchString(p.Name()) {
+			continue
+		}
+		entries, err := os.ReadDir(filepath.Join(root, p.Name()))
+		if err != nil {
+			continue
+		}
+		for _, e := range entries {
+			name := e.Name()
+			if e.IsDir() || !strings.HasSuffix(name, suffix) {
+				continue
+			}
+			at, err := time.Parse("20060102T150405Z",
+				strings.TrimSuffix(name, suffix))
+			if err == nil && at.After(newest) {
+				newest = at
+			}
+		}
+	}
+	return newest, !newest.IsZero()
+}
+
+// newestSnapshotPath returns the path of the newest snapshot, for dedupe.
+func newestSnapshotPath(lake string, f feed) (string, bool) {
+	at, ok := lastSnapshotAt(lake, f)
+	if !ok {
+		return "", false
+	}
+	dir, name := snapshotPath(lake, f, at)
+	return filepath.Join(dir, name), true
+}
+
+// resolveAuth reads every header credential this feed needs. It returns an
+// error if any is missing so the caller can skip the feed rather than send an
+// unauthenticated request and record a 401 as real data.
+func resolveAuth(f feed) (map[string]string, error) {
+	if len(f.auth) == 0 {
+		return nil, nil
+	}
+	out := make(map[string]string, len(f.auth))
+	for _, a := range f.auth {
+		v, err := readSecret(a.secret)
+		if err != nil {
+			return nil, fmt.Errorf("header %s: %w", a.header, err)
+		}
+		out[a.header] = v
+	}
+	return out, nil
+}
+
+// sameAsNewest reports whether path holds bytes identical to this feed's most
+// recent snapshot. Compares size first: these files are megabytes, and the
+// overwhelmingly common case for a slow-changing source is "identical", which
+// a size check cannot prove but a size MISMATCH can disprove for free.
+func sameAsNewest(lake string, f feed, path string) bool {
+	prev, ok := newestSnapshotPath(lake, f)
+	if !ok {
+		return false
+	}
+	a, err := os.Stat(prev)
+	if err != nil {
+		return false
+	}
+	b, err := os.Stat(path)
+	if err != nil || a.Size() != b.Size() {
+		return false
+	}
+	sum := func(p string) ([]byte, error) {
+		fh, err := os.Open(p)
+		if err != nil {
+			return nil, err
+		}
+		defer func() { _ = fh.Close() }()
+		h := sha256.New()
+		if _, err := io.Copy(h, fh); err != nil {
+			return nil, err
+		}
+		return h.Sum(nil), nil
+	}
+	x, err := sum(prev)
+	if err != nil {
+		return false
+	}
+	y, err := sum(path)
+	return err == nil && bytes.Equal(x, y)
+}
+
 // alreadyHaveToday reports whether a daily feed has already been captured for
 // this dt= partition.
 func alreadyHaveToday(lake string, f feed, at time.Time) bool {
@@ -457,6 +712,13 @@ func fetchFeed(ctx context.Context, client *http.Client, url, lake string,
 		return "", 0, err
 	}
 	req.Header.Set("User-Agent", userAgent)
+	headers, err := resolveAuth(f)
+	if err != nil {
+		return "", 0, err
+	}
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -498,6 +760,13 @@ func fetchFeed(ctx context.Context, client *http.Client, url, lake string,
 	// it; 0600 only blocks debugging without protecting anything.
 	if err := os.Chmod(tmpName, 0o644); err != nil {
 		return "", 0, err
+	}
+
+	// Dedupe before the rename, while the bytes are still in a temp file the
+	// deferred Remove will clean up. Doing it after would publish the
+	// duplicate and then have to delete a file readers may already have seen.
+	if f.dedupe && sameAsNewest(lake, f, tmpName) {
+		return "", n, nil
 	}
 
 	final := filepath.Join(dir, name)

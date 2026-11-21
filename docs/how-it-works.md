@@ -1,8 +1,17 @@
 # How chandb-rev2 works
 
-chandb-rev2 archives live transit data from **MBTA** (Boston), **BART** (SF
-Bay Area) and **SEPTA** (Philadelphia) and publishes it as a public website. On that site anyone can run SQL
-against the archive, look at a live departure board, or view train positions on world and city maps.
+chandb-rev2 is a public data lake you query from your own browser. It carries
+two unrelated domains that share the same storage layout, pipeline and portal:
+
+- **Transit** — live data from **MBTA** (Boston), **BART** (SF Bay Area) and
+  **SEPTA** (Philadelphia), archived every 30 minutes. A SQL explorer, a live
+  departure board, and train positions on world and city maps.
+- **Broadband** — what ISPs claim they serve to the FCC against what can
+  actually be measured, per census tract, for Boston and the Bay Area.
+
+The two share no schema and no join key. They coexist because the lake layout,
+the ingest loop, the browser-side query engine and the verification harness are
+all domain-agnostic — not because the data is related.
 
 The whole system is two Go binaries built into one container image, a directory
 of files on disk (the "lake"), and some deploy plumbing:
@@ -43,22 +52,24 @@ explains why.
 | [cmd/pipeline/static.go](../cmd/pipeline/static.go) | Unzips static GTFS lookup tables into bronze |
 | [cmd/pipeline/gold.go](../cmd/pipeline/gold.go) | DuckDB SQL joins → daily Parquet (**gold**) |
 | [cmd/pipeline/prune.go](../cmd/pipeline/prune.go) | Retention: deletes old raw/bronze partitions |
+| [cmd/pipeline/broadband.go](../cmd/pipeline/broadband.go) | The broadband domain: FCC/Ookla/ACS/TIGER ingest and its gold tables |
 | [cmd/portal/main.go](../cmd/portal/main.go) | HTTP server: pages, dataset listing, Parquet files |
 | [cmd/portal/chandb.js](../cmd/portal/chandb.js) | Shared browser runtime (boots DuckDB-WASM, registers datasets) |
-| [cmd/portal/index.html](../cmd/portal/index.html) | SQL viewer page (`/`) |
-| [cmd/portal/board.html](../cmd/portal/board.html) | Departure board page (`/board`) |
-| [cmd/portal/maps.html](../cmd/portal/maps.html) | World and city train maps (`/maps`) |
+| [cmd/portal/index.html](../cmd/portal/index.html) + [index.js](../cmd/portal/index.js) | SQL viewer page (`/`) |
+| [cmd/portal/board.html](../cmd/portal/board.html) + [board.js](../cmd/portal/board.js) | Departure board page (`/board`) |
+| [cmd/portal/maps.html](../cmd/portal/maps.html) + [maps.js](../cmd/portal/maps.js) | World and city train maps (`/maps`) |
+| [cmd/portal/broadband.html](../cmd/portal/broadband.html) + [broadband.js](../cmd/portal/broadband.js) | Measured broadband by census tract (`/broadband`) |
+| [cmd/portal/portal.css](../cmd/portal/portal.css) | The single stylesheet: design tokens plus all shared chrome |
 | [Dockerfile](../Dockerfile) | Builds both binaries into one image |
+| [Makefile](../Makefile) | Task runner — `make help` lists everything |
 | [deploy/docker-compose.yml](../deploy/docker-compose.yml) | Production stack: portal, pipeline, cloudflared |
 | [infra/ansible/playbook.yml](../infra/ansible/playbook.yml) | One-time VPS provisioning |
-| [.github/workflows/ci.yml](../.github/workflows/ci.yml) | Lint/test/build on every PR and push |
+| [.claude/skills/verify/SKILL.md](../.claude/skills/verify/SKILL.md) | The verification harness: what it checks and what each failure means |
+| [scripts/verify/](../scripts/verify/) | The harness itself — seed, boot, drive, capture |
+| [testdata/lake/](../testdata/lake/) | Deterministic bronze + static GTFS fixtures the harness seeds from |
+| [.github/workflows/ci.yml](../.github/workflows/ci.yml) | Lint/test/build/verify on every PR and push |
 | [.github/workflows/deploy.yml](../.github/workflows/deploy.yml) | Build image → push to GHCR → deploy over SSH |
 | `docs/gitops-plan.md` | The long-form deploy plan (gitignored, local only) |
-
-**Stale files:** [Makefile](../Makefile) and
-[docker-compose.dev.yml](../docker-compose.dev.yml) come from rev1 (Python,
-Postgres, Metabase). They point at a root `docker-compose.yml` and a `pipeline/`
-Python package, and neither exists anymore. Don't use them to run this code.
 
 ---
 
@@ -70,9 +81,16 @@ DuckDB can tell from the directory names which days a query touches.
 
 | Layer | Format | Contents | Kept for |
 |---|---|---|---|
-| `raw/` | `.pb`, `.zip` | Response bodies saved byte-for-byte, never parsed | 14 days (`RAW_RETENTION_DAYS`) |
-| `bronze/` | `.ndjson`, `.txt` | Each raw snapshot parsed into one JSON row per entity | 2 days (`BRONZE_RETENTION_DAYS`) |
-| `gold/` | `.parquet` | Joined with static GTFS, one compacted file per day | **Forever** |
+| `raw/` | `.pb`, `.zip`, `.parquet`, `.json`, `.csv` | Response bodies saved byte-for-byte, never parsed | 14 days (`RAW_RETENTION_DAYS`) |
+| `bronze/` | `.ndjson`, `.txt`, `.parquet` | Each raw snapshot parsed into rows | 2 days (`BRONZE_RETENTION_DAYS`) |
+| `gold/` | `.parquet` | Joined and compacted; the only layer the portal serves | **Forever** |
+
+Those retention numbers apply to the **transit** agencies only. The broadband
+sources (`ookla`, `census`, `fcc`) are exempt and never pruned at any age: they
+publish quarterly or twice a year, they are small, and change over time is the
+product rather than a buffer. Pruning them would also break the pipeline
+outright — see
+[the broadband section](#the-second-domain-broadband-cmdpipelinebroadbandgo).
 
 Why it's split this way:
 
@@ -96,9 +114,16 @@ later cycle never sees a half-written file.
 ### Running modes
 
 ```
-pipeline          # serve: run a cycle now, then on every INGEST_INTERVAL boundary
-pipeline -once    # one cycle, exit non-zero if any feed failed (backfill/testing)
+pipeline           # serve: run a cycle now, then on every INGEST_INTERVAL boundary
+pipeline -once     # one cycle, exit non-zero if any feed failed (backfill/testing)
+pipeline -rebuild  # re-derive bronze and gold from existing raw, then exit
 ```
+
+`-rebuild` skips `ingestAll` and `prune`, so it needs no network and cannot
+delete anything. It is how you repair a day whose last cycle failed (delete
+that partition's Parquet and re-run), and it is what the verify harness uses to
+build gold from committed fixtures through the real transform rather than a
+hand-written copy of the schema.
 
 In production it runs as a long-lived compose service and keeps its own
 schedule. Nothing external triggers it. GitHub Actions cron was rejected
@@ -135,11 +160,9 @@ agency, feed name, byte count, and destination path; failures include the
 feed and error; and the final `cycle ok`, `cycle finished with failures`, or
 `cycle interrupted` record includes total elapsed milliseconds. This makes
 fetch failures and end-to-end cycle time measurable without parsing the lake.
-Stage-level timings are intentionally not yet exposed: the pipeline and portal
-refactor currently changes the stage functions, so adding instrumentation there
-would overlap that work. The safe current boundary is the cycle timer; a future
-stage result can add `ingest_ms`, `bronze_ms`, `gold_ms`, and `prune_ms` while
-preserving the same structured fields.
+Stage-level timings are not exposed yet. The current boundary is the cycle
+timer; a future stage result can add `ingest_ms`, `bronze_ms`, `gold_ms` and
+`prune_ms` while preserving the same structured fields.
 
 The performance model is deliberately asymmetric. Network fetches are
 parallelized with a fixed four-worker pool, while bronze and gold remain
@@ -272,6 +295,136 @@ deleted. `gold/` is never touched.
 | `SECRETS_DIR` | `/run/secrets` | Directory of secret *files* |
 | `RAW_RETENTION_DAYS` | `14` | |
 | `BRONZE_RETENTION_DAYS` | `2` | |
+| `DUCKDB_EXTENSION_DIR` | unset | Where `httpfs`/`spatial` live. Set in the image; unset locally so `INSTALL` works normally |
+
+---
+
+## The second domain: broadband (`cmd/pipeline/broadband.go`)
+
+The lake holds two unrelated domains. Transit is above; this one asks whether
+the broadband coverage ISPs report to the FCC matches what anyone can measure,
+for Suffolk County (Boston) and the nine-county Bay Area.
+
+The FCC's Broadband Data Collection is **self-reported by providers** and is the
+map federal funding is allocated from. It is persistently optimistic — a
+provider may report a whole census block as served if it could serve one
+location there within ten business days. There is no published ground truth, so
+three independent angles get assembled and the *disagreement* between them is
+the finding:
+
+| Angle | Source | What it actually means |
+|---|---|---|
+| **Claimed** | FCC BDC area summaries | % of locations by technology. Fiber-to-the-premises is code 50 |
+| **Measured** | Ookla open data | Performance where people ran a speed test, on ~600m tiles |
+| **Subscribed** | Census ACS table B28002 | Households reporting they actually buy broadband |
+
+**None of these is ground truth, and no view may imply otherwise.** Measured
+speed is not availability: a tract with no fiber can post fast numbers on good
+cable, and a tract with no tests is *unmeasured*, not *unserved*. Everything
+keys on the 11-digit census tract GEOID, which is also what ACS joins on — that
+is what turns "this tract claims 94% fibre" into "claimed coverage is lowest in
+the poorest tracts".
+
+### Why this does not store diffs
+
+The brief was to ingest only diffs to keep storage low. Diffs at raw would cost
+the replay-buffer invariant: you cannot re-derive bronze and gold through
+changed parsing logic from a diff, and one corrupted diff silently corrupts
+every later state. Two mechanisms get the same storage result without that:
+
+- **Cadence** (`feed.every`). Each source declares how often it is worth
+  re-checking, measured against the newest snapshot on disk. The timestamp is
+  read from the **filename**, not the mtime — a restore, an rsync or a volume
+  copy rewrites mtimes, which would make every archived snapshot look like it
+  arrived just now and suppress all future fetches.
+- **Content dedupe** (`feed.dedupe`). A snapshot byte-identical to its
+  predecessor is dropped before it is ever published, so polling a twice-yearly
+  dataset weekly does not accumulate fifty copies.
+
+Transit feeds use neither, and tests enforce that: two identical GTFS-RT
+snapshots are two real observations thirty minutes apart, and deduplicating
+them would destroy data.
+
+### The Ookla extract
+
+Ookla publishes one **350 MB global Parquet per quarter**. Downloading it whole
+would cost ~1.4 GB/year to store data we overwhelmingly do not want.
+
+`ooklaFetch` instead reads it remotely over HTTP range requests and keeps only
+the tiles covering our metros. The files are sorted by `quadkey`, and a quadkey
+is the Bing Maps tile id — a base-4 string where each character subdivides the
+previous tile, so **a prefix is a bounding region**. Filtering on a prefix lets
+Parquet row-group statistics prune nearly every row group, and DuckDB fetches
+only the surviving byte ranges. Covering both metros at zoom 9 takes 22
+prefixes.
+
+Measured: **350 MB → 1.12 MB in about five seconds**, a 313× reduction.
+
+This is the one place `raw means raw` is deliberately relaxed, and only because
+Ookla archives these files permanently. Upstream is already the replay buffer,
+so storing the full body would preserve a guarantee we have anyway. The source
+URL is written to a `.source` file beside each extract, so re-derivation is
+mechanical rather than archaeological.
+
+### Credentials
+
+Two sources need free credentials and are **skipped, not failed**, until they
+exist — the same behaviour as BART's 511 key:
+
+| Secret file | Get it from |
+|---|---|
+| `census_api_key` | <https://api.census.gov/data/key_signup.html> |
+| `fcc_username`, `fcc_hash_value` | <https://broadbandmap.fcc.gov/> → register → API access |
+
+FCC credentials go in **headers**, not the URL, via `feed.auth` — a token in a
+URL ends up in every log line and stack trace that mentions the request.
+
+> **Unverified:** the FCC two-step list-then-download flow could not be
+> exercised while this was written. The API returns 401 without credentials and
+> the host runs Akamai bot management. If it fails once credentials exist, the
+> fallback is downloading the twice-yearly files by hand into
+> `raw/fcc/<feed>/dt=…/` — everything downstream reads the lake, not the API.
+
+### Gold tables
+
+Broadband gold is a separate pass (`transformBroadbandGold`), not more
+`goldTables` entries, because its inputs are **snapshots of a current state**
+rather than an append-only stream. It reads the newest partition of each input
+and rewrites each table whole; partition finality, which matters a great deal
+for transit, would only pin a stale view of the present.
+
+| Table | A row is |
+|---|---|
+| `broadband/tract_measured` | One tract with speed tests: weighted and median down/up, min/max, latency, and the share of tests clearing 100 and 25 Mbps |
+| `broadband/tract_coverage` | **Every** tract, measured or not, with `unmeasured` flagged and `tiles_per_km2` |
+
+`tract_coverage` uses a LEFT JOIN on purpose. A tract with no speed tests is the
+most interesting row in the dataset — it is either genuinely unserved or simply
+unmeasured — and an INNER JOIN would silently delete exactly those tracts from
+every chart built on the table.
+
+Speeds are test-weighted rather than averaged: a tile with 400 tests is a far
+better estimate than one with a single test, and a plain `AVG()` lets one lucky
+gigabit test outvote a hundred slow ones. The unweighted median is kept beside
+it so the two can be compared — a large gap means the tract's figure rests on a
+handful of tiles.
+
+### Geometry
+
+TIGER tract boundaries come from the Census as shapefiles. `extractTracts`
+reads them **in place inside the zip** through GDAL's `/vsizip/` layer, since
+unpacking would write ~100 MB of `.shp`/`.dbf`/`.shx` for a file read once, and
+keeps only the counties we cover: 235 Suffolk tracts, 1,772 Bay Area.
+
+Geometry is stored as **WKT text**, not a native geometry type, so the files
+stay readable by a plain Parquet reader — including DuckDB-WASM in the browser,
+which is not guaranteed to have the spatial extension loaded.
+
+`httpfs` and `spatial` are baked into the image by `pipeline -install-extensions`
+at build time. The runtime container is read-only with `cap_drop: [ALL]`, so a
+runtime `INSTALL` — which writes to the extension directory and downloads
+executable code — cannot work there, and should not. This costs ~108 MB of
+image, nearly all of it spatial. Locally, `make duckdb-ext` installs them.
 
 ---
 
@@ -284,17 +437,45 @@ deleted. `gold/` is never touched.
 | `GET /` | SQL viewer (`index.html`, embedded) | `no-cache` |
 | `GET /board` | Departure board (`board.html`, embedded) | `no-cache` |
 | `GET /maps` | World and city train maps (`maps.html`, embedded) | `no-cache` |
-| `GET /chandb.<hash>.js` | Shared JS module | `max-age=1y, immutable` |
-| `GET /chandb.js` | Same file without the hash, for pages cached from an older deploy | `no-cache` |
+| `GET /broadband` | Measured broadband (`broadband.html`, embedded) | `no-cache` |
+| `GET /<name>.<hash>.js` | A JS module: `chandb`, `index`, `board`, `maps` or `broadband` | `max-age=1y, immutable` |
+| `GET /<name>.js` | Same bytes without the hash, for pages cached from an older deploy | `no-cache` |
+| `GET /portal.css` | The single stylesheet | `no-cache` |
 | `GET /api/datasets` | Lists gold Parquet files, grouped as `<agency>_<table>` | 60 s |
 | `GET /data/…` | `http.FileServer` over **`/lake/gold` only** | 60 s for today's partition, 1 day + immutable for past ones |
 | `GET /healthz` | Returns `ok` | `no-store` |
 
-The four frontend files are compiled into the binary with `//go:embed`.
-`buildAssets()` hashes `chandb.js` and rewrites the `/chandb.js` references in
-both pages to the hashed URL. This prevents a bug where a browser pairs a fresh
-page with a stale cached module. The mismatch fails as a parse-time
-SyntaxError, and the page hangs silently.
+Every frontend file is compiled into the binary with `//go:embed`.
+`buildAssets()` content-hashes each JS module and rewrites the references to
+it. This prevents a bug where a browser pairs a fresh page with a stale cached
+module: the mismatch fails as a parse-time SyntaxError, so no handler runs and
+the page hangs silently on its first status line.
+
+The order inside `buildAssets` is load-bearing. `chandb.js` is hashed first
+because the page modules import it, so their bodies — and therefore their
+own hashes — depend on its hashed path. The result is two levels of
+indirection: a page loads `/index.<hash>.js`, and *that* module imports
+`/chandb.<hash>.js`.
+
+`buildAssets` returns an `assets` value rather than writing package globals.
+The routes depend on it (`hashedPath` is half of a mux pattern), so passing it
+to `portalRoutes` makes that ordering a compile-time fact instead of an
+init-order trap.
+
+### Styling
+
+There is one stylesheet, `portal.css`. It holds the design tokens in `:root`
+and all the shared chrome — header, nav, `main`, `.intro`, `#status`, buttons,
+inputs, tables. Each page's `<style>` block holds only layout that is genuinely
+its own, and the `<link>` comes **first** so those page rules override the
+shared sheet rather than fighting it.
+
+This used to be two competing systems: the pages referenced `--fg`, `--muted`,
+`--panel`, `--panel-2` and `--focus`, which no file defined, while `portal.css`
+shipped a different vocabulary (`--ink`, `--bg-sink`, …). An unresolved `var()`
+drops its whole declaration, so those rules silently did nothing. The verify
+harness now resolves every `var(--x)` against the `:root` definitions and fails
+if any is undefined.
 
 `http.FileServer` supports HTTP Range requests natively, and the browser-side
 engine depends on that. `http.Dir` rejects `..`, so a request can't reach
@@ -328,7 +509,7 @@ deploy they can disagree about which columns exist. `columnsOf()` runs
 - write their SQL to match the columns that are present, for example by
   falling back from `vehicle_type` to `route_type` (`board.html`).
 
-The two pages:
+The pages:
 
 - **`/` (SQL viewer):** a textarea with example queries (where trains are now,
   lateness by hour, dwell times, data quality by `lead_time_s`, and more). A
@@ -340,6 +521,25 @@ The two pages:
   after, groups them by (agency, stop), sorts rail ahead of bus and then by
   soonest arrival, and draws at most 60 stations. Filters cover agency, mode
   and stop name.
+- **`/broadband` (measured broadband):** tract-level Ookla speed tests for
+  Suffolk County, MA and the nine Bay Area counties. The whole page is built
+  around one distinction this data makes very easy to lose: a **measured speed
+  is not availability**, and a tract with no tests is **unmeasured, not
+  unserved**. So the caveat sits above the first chart rather than in a footer,
+  and unmeasured tracts get their own ledger tile, stay off the speed axis, are
+  drawn as hollow rings in a colour the speed ramp never produces, are listed
+  separately, and are never allowed into the ranking table. The second
+  confidence signal, `tests`, drives an evidence tier on every figure —
+  thin-evidence bars are hatched, thin-evidence rows are dimmed, and the
+  evidence scatter exists purely to show how far a sparsely-tested tract can
+  wander. `broadband.js` also declares the FCC claimed-coverage and ACS
+  demographic columns it *would* join; those tables need credentials that do
+  not exist yet, so each join is skipped until its table appears rather than
+  erroring for every visitor.
+
+  `geometry_wkt` reaches bronze but not gold, so the two tract maps plot
+  centroids rather than polygons. Adding the boundary column to
+  `tract_coverage` would turn them into real choropleths.
 
 `rowsOf()`/`num()` convert DuckDB-WASM's `BigInt` columns to `Number`. Mixing
 the two types in arithmetic or in `Array.sort` throws an error.
@@ -395,6 +595,11 @@ Runs on every PR and every push to `main`:
 
 - `go vet`, `go build` and `go test -race`;
 - `golangci-lint`;
+- the **verify harness** in headless chromium, uploading its screenshots,
+  console log and trace as artifacts (on failure especially). An exit 2 —
+  INFRA_FAIL, meaning the jsDelivr CDN or chromium itself was the problem —
+  annotates a warning instead of failing the job, so a CDN blip cannot block a
+  merge;
 - a Docker build with no push;
 - `ansible-lint` on the playbook.
 
@@ -448,18 +653,58 @@ The playbook:
 
 ## Working on it locally
 
+`make help` lists every target. The short version:
+
 ```
-go test -race ./...                      # everything is unit tested
+make setup          # one time: Playwright + chromium (~150MB)
+make verify         # seed, boot, drive all three pages, write a PASS/FAIL report
+make test           # go test -race ./...
+make dev-pipeline   # one real fetch + all transforms into .verify/lake
+make dev-portal     # serve that lake on :8080
+```
+
+Or by hand, against any lake you like:
+
+```
+go test -race ./...
 mkdir -p /tmp/lake
 LAKE_DIR=/tmp/lake go run ./cmd/pipeline -once     # real fetch + all transforms
 LAKE_DIR=/tmp/lake PORTAL_ADDR=:8080 go run ./cmd/portal
-# open http://localhost:8080 and http://localhost:8080/board
+# open http://localhost:8080, /board and /maps
 ```
 
 The pipeline needs a C toolchain because DuckDB uses cgo. Without
 `SECRETS_DIR/511_api_key`, the BART vehicle-positions feed is skipped.
 
-The tests cover the invariants the comments describe:
+### Verifying a change
+
+`go test` covers the server. It cannot tell you whether the *page* works,
+because the query engine runs in the visitor's browser — a green test suite is
+compatible with all four maps rendering blank, or with `/broadband` quietly
+drawing every unmeasured tract as a zero. `make verify` closes that gap:
+
+1. **Seed.** `.verify/lake/` is rebuilt from scratch from the fixtures in
+   `testdata/lake/`, with timestamps stamped relative to now (`/board` treats
+   `max(last_seen)` as "now"; a frozen fixture renders an empty page). Gold is
+   then built by the real `pipeline -rebuild`, never hand-written, so the
+   fixture cannot drift from `gold.go`.
+2. **Exercise.** The go suite, then live HTTP checks (Range → 206, traversal →
+   404, cache headers), then headless chromium actually driving `/`, `/board`,
+   `/maps` and `/broadband` — running an example query, clicking filters,
+   reading pixels back off each map canvas, and asserting that `/broadband`
+   keeps unmeasured tracts both visually and structurally distinct from slow
+   ones.
+3. **Capture.** Screenshots, console log, network failures, a Playwright trace
+   and a PASS/FAIL table land in `.verify/run-<timestamp>/`, symlinked as
+   `.verify/latest/`.
+4. **Verdict.** Exit **0** pass, **1** the code is broken, **2** blocked by
+   infrastructure (CDN unreachable, port taken, chromium missing) — which is
+   explicitly *not* a code failure and is only a warning in CI.
+
+[.claude/skills/verify/SKILL.md](../.claude/skills/verify/SKILL.md) documents
+every check, its threshold, and where to look first when it fails.
+
+The unit tests cover the invariants the comments describe:
 
 - Hive paths and UTC normalisation;
 - atomic writes that leave no partial files;
@@ -467,7 +712,8 @@ The tests cover the invariants the comments describe:
 - zip-slip, and skipping incomplete static snapshots;
 - `dtPartition` rejecting SQL injection;
 - retention that never touches gold;
-- Range requests, `..` traversal, and the content-hash caching scheme.
+- Range requests, `..` traversal, and the content-hash caching scheme,
+  including that editing `chandb.js` moves every dependent module's URL.
 
 ### Adding things
 
@@ -493,10 +739,10 @@ The tests cover the invariants the comments describe:
   stop and time columns, and the board skips them. To fix this, join
   `stop_times.txt` (2.7 MB for rail) on `(trip_id, stop_sequence)` and apply
   the delay to scheduled times.
-- **A failed last cycle of the day is never rebuilt.** Once a day is in the
-  past, its gold file counts as final. If the 23:30 UTC cycle failed, that day
-  is missing those snapshots until someone deletes the Parquet file and lets
-  the pipeline rebuild it (raw is still there for 14 days).
+- **A failed last cycle of the day is never rebuilt automatically.** Once a day
+  is in the past, its gold file counts as final. If the 23:30 UTC cycle failed,
+  that day is missing those snapshots until someone deletes the Parquet file
+  and re-runs `pipeline -rebuild` (raw is still there for 14 days).
 - **Static zips are re-extracted every cycle.** In `transformBronze`, the zip
   branch runs before the bronze-retention check. Raw static zips from day 3 to
   day 14 get re-extracted into bronze on every cycle, and `prune` deletes them
@@ -506,5 +752,19 @@ The tests cover the invariants the comments describe:
 - **Some code comments disagree with compose.** Comments in `gold.go` describe
   a 512 MB container and a 48 MB tmpfs. Compose sets `mem_limit: 1g` and a 64 MB
   `/tmp`. The DuckDB limit is 512 MB either way.
-- **The Makefile and `docker-compose.dev.yml` are from rev1** (see the
-  repository map).
+- **The FCC ingest path is unverified.** It returns 401 without credentials
+  and the host runs bot management, so the two-step list-then-download flow has
+  never run against the live service. Until it does, `tract_claimed` does not
+  exist and nothing can compare claimed against measured — which is the whole
+  premise of the domain.
+- **80 of 2,007 tracts have no speed tests at all.** They are carried through
+  `tract_coverage` with `unmeasured` set rather than dropped, because whether
+  they are unserved or merely unmeasured is not something this data can
+  distinguish, and an INNER JOIN would quietly delete the question.
+- **Ookla measures performance, not availability.** A tract with no fibre can
+  post fast numbers on good cable. Nothing here can tell you what is actually
+  installed at an address.
+- **BART has no vehicle positions, so the Bay Area map is always empty.** The
+  page says "No positions published" and the verify harness reports `maps.bay`
+  as a WARN rather than a failure. Wiring up the 511 feed (already reaching
+  bronze) to a `bart/vehicle_positions` gold table would fill it in.

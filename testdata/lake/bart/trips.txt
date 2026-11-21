@@ -1,0 +1,6 @@
+trip_id,route_id,trip_headsign
+bart-y-101,ROUTE 1,SFIA/Millbrae
+bart-y-102,ROUTE 1,Antioch
+bart-o-203,ROUTE 3,Berryessa/North San Jose
+bart-g-305,ROUTE 5,Daly City
+bart-r-407,ROUTE 7,Millbrae

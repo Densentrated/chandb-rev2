@@ -1,0 +1,5 @@
+route_id,route_short_name,route_long_name,route_type,route_color
+ROUTE 1,YELLOW-S,Antioch to SFIA/Millbrae,1,ffff33
+ROUTE 3,ORANGE-S,Richmond to Berryessa/North San Jose,1,ff9933
+ROUTE 5,GREEN-S,Berryessa/North San Jose to Daly City,1,339933
+ROUTE 7,RED-S,Richmond to Millbrae,1,ff0000

@@ -1,0 +1,5 @@
+route_id,route_short_name,route_long_name,route_type,route_color
+MFL,MFL,Market-Frankford Line,1,0000FF
+BSL,BSL,Broad Street Line,1,FF7F00
+10,10,Route 10 Trolley,0,008000
+17,17,Route 17 Bus,3,91268F

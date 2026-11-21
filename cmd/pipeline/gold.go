@@ -382,7 +382,57 @@ func openDuckDB(lake string) (*sql.DB, error) {
 			return nil, fmt.Errorf("%s: %w", pragma, err)
 		}
 	}
+
+	// Extensions (httpfs for remote Parquet, spatial for tract geometry) are
+	// installed at IMAGE BUILD time and pointed at here. The production
+	// container runs read-only with cap_drop: [ALL], so a runtime INSTALL —
+	// which writes to ~/.duckdb and fetches over the network — cannot work.
+	// Empty means "wherever DuckDB defaults to", which is right for local dev
+	// where INSTALL does work.
+	if dir := os.Getenv("DUCKDB_EXTENSION_DIR"); dir != "" {
+		if _, err := db.Exec("SET extension_directory='" + dir + "'"); err != nil {
+			_ = db.Close()
+			return nil, fmt.Errorf("extension_directory: %w", err)
+		}
+	}
 	return db, nil
+}
+
+// duckdbExtensions are the extensions the pipeline needs beyond core DuckDB.
+var duckdbExtensions = []string{
+	"httpfs",  // read_parquet over HTTP range requests (Ookla extract)
+	"spatial", // ST_Read on TIGER shapefiles, point-in-polygon tract joins
+}
+
+// installExtensions downloads the extensions into DUCKDB_EXTENSION_DIR. It is
+// run once during the Docker build, never at runtime — see openDuckDB.
+func installExtensions() error {
+	dir := os.Getenv("DUCKDB_EXTENSION_DIR")
+	if dir == "" {
+		return fmt.Errorf("DUCKDB_EXTENSION_DIR must be set")
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	db, err := sql.Open("duckdb", "")
+	if err != nil {
+		return err
+	}
+	defer func() { _ = db.Close() }()
+
+	if _, err := db.Exec("SET extension_directory='" + dir + "'"); err != nil {
+		return err
+	}
+	for _, ext := range duckdbExtensions {
+		if _, err := db.Exec("INSTALL " + ext); err != nil {
+			return fmt.Errorf("install %s: %w", ext, err)
+		}
+		if _, err := db.Exec("LOAD " + ext); err != nil {
+			return fmt.Errorf("load %s after install: %w", ext, err)
+		}
+		slog.Info("duckdb extension installed", "extension", ext, "dir", dir)
+	}
+	return nil
 }
 
 // latestStaticDir returns the newest bronze GTFS snapshot that actually has

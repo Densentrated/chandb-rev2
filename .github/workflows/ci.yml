@@ -9,28 +9,7 @@ permissions:
   contents: read
 
 jobs:
-  # The Go scaffold doesn't exist yet. Rather than leave CI permanently red —
-  # which would block every merge once branch protection is on — detect whether
-  # there's anything to build. These jobs light up on their own the moment
-  # go.mod lands; nothing here needs changing later.
-  detect:
-    runs-on: ubuntu-latest
-    outputs:
-      has_go: ${{ steps.d.outputs.has_go }}
-    steps:
-      - uses: actions/checkout@v6
-      - id: d
-        run: |
-          if [ -f go.mod ]; then
-            echo "has_go=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "has_go=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::No go.mod yet - skipping the go and image jobs."
-          fi
-
   go:
-    needs: detect
-    if: needs.detect.outputs.has_go == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -43,9 +22,47 @@ jobs:
       - run: go test -race ./...
       - uses: golangci/golangci-lint-action@v9
 
+  # The browser tier. go test proves the server hands out bytes; this proves a
+  # real browser turns those bytes into a page that renders and answers a
+  # query. The engine is DuckDB-WASM running client-side, so everything worth
+  # breaking breaks after the HTML arrives — see .claude/skills/verify/SKILL.md.
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npx playwright install --with-deps chromium
+      # Exit 2 is INFRA_FAIL: the CDN serving the 34MB DuckDB-WASM bundle was
+      # unreachable, the port was taken, chromium was missing. None of those
+      # are a reason to block a merge, so they annotate instead of failing.
+      # Exit 1 is a real regression and still fails the job.
+      - name: Run the verify harness
+        run: |
+          rc=0; scripts/verify/run.sh || rc=$?
+          if [ "$rc" -eq 2 ]; then
+            echo "::warning::verify was BLOCKED (infrastructure), not failed - see the uploaded artifacts"
+            exit 0
+          fi
+          exit "$rc"
+      # Artifacts are the point: a failure here is a screenshot and a console
+      # log, not a line number. Upload them even when the run fails —-
+      # especially then.
+      - if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: verify-${{ github.run_id }}
+          path: .verify/run-*/
+          retention-days: 14
+
   image:
-    needs: detect
-    if: needs.detect.outputs.has_go == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -88,7 +105,7 @@ jobs:
   # you would get a green merge button on a broken build.
   ci-ok:
     if: always()
-    needs: [detect, go, image, infra]
+    needs: [go, verify, image, infra]
     runs-on: ubuntu-latest
     steps:
       - name: Fail if any upstream job did not succeed

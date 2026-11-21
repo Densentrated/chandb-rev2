@@ -1,0 +1,4 @@
+trip_id,route_id,trip_headsign
+septarail-pao-501,PAO,Thorndale
+septarail-tre-502,TRE,Trenton
+septarail-air-503,AIR,Airport Terminal E

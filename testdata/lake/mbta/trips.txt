@@ -1,0 +1,8 @@
+trip_id,route_id,trip_headsign
+mbta-red-001,Red,Alewife
+mbta-red-002,Red,Ashmont
+mbta-grn-001,Green-B,Boston College
+mbta-grn-002,Green-B,Government Center
+mbta-cr-001,CR-Providence,Providence
+mbta-bus-001,1,Harvard Square
+mbta-bus-002,1,Nubian Station

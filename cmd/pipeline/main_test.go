@@ -223,3 +223,53 @@ func TestGoldPartitionChangedUsesBronzeWatermark(t *testing.T) {
 		t.Fatal("new bronze input should require a rebuild")
 	}
 }
+
+// -rebuild has two jobs: never touch the network, and refuse to look like a
+// success when it produced nothing. Both are what the verify harness relies on
+// to tell "the fixture is wrong" apart from "the portal is wrong".
+func TestRebuildFailsWhenItProducesNoGold(t *testing.T) {
+	lake := t.TempDir()
+	t.Setenv("LAKE_DIR", lake)
+
+	err := runRebuild()
+	if err == nil {
+		t.Fatal("rebuild over an empty lake must not report success")
+	}
+	if !strings.Contains(err.Error(), "no parquet") {
+		t.Errorf("err = %v, want it to name the empty gold tree", err)
+	}
+
+	// ingestAll is the only stage that writes raw/. Its absence is the proof
+	// that -rebuild stayed offline.
+	if _, statErr := os.Stat(filepath.Join(lake, "raw")); !os.IsNotExist(statErr) {
+		t.Errorf("rebuild created a raw tree; it must not fetch anything")
+	}
+}
+
+func TestCountGoldParquetCountsOnlyParquet(t *testing.T) {
+	lake := t.TempDir()
+
+	// A lake with no gold tree yet is zero, not an error.
+	n, err := countGoldParquet(lake)
+	if err != nil || n != 0 {
+		t.Fatalf("empty lake: n = %d, err = %v, want 0, nil", n, err)
+	}
+
+	dir := filepath.Join(lake, "gold", "mbta", "vehicle_positions", "dt=2026-10-07")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"part-0.parquet", "part-0.parquet.partial", "README"} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	n, err = countGoldParquet(lake)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Errorf("n = %d, want 1 (a .partial is not a published partition)", n)
+	}
+}

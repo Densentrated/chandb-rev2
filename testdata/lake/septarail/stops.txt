@@ -1,0 +1,8 @@
+stop_id,stop_name,stop_lat,stop_lon
+90004,Suburban Station,39.954247,-75.168258
+90005,Jefferson Station,39.952703,-75.158119
+90006,30th Street Station,39.955795,-75.182158
+90007,Ardmore,40.007099,-75.291229
+90008,Paoli,40.042267,-75.482597
+90009,Airport Terminal A,39.874321,-75.246392
+90010,Temple University,39.981107,-75.149398
